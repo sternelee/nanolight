@@ -320,3 +320,36 @@ test "home-relative file parents survive multiple rows and native text layout" {
         tester.frame();
     }
 }
+
+test "an emptied scope drops the last answer's file rows" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const scope = @import("files_scope.zig");
+    var ix: Index = .init(gpa);
+    defer ix.deinit();
+    var s: view.Nanolight = .{ .index = &ix, .files_on = true, .files_scope = scope.Scope.withDefaults() };
+    defer s.query.deinit();
+    defer s.found.deinit();
+    // The last answer Spotlight gave, for a query the scope still covered.
+    _ = s.found.add("/tmp/holiday", false, .{ .score = 100 });
+    s.query.set("ho");
+    s.built = 1;
+    s.rebuild();
+    try t.expectEqual(@as(usize, 1), s.found.n);
+    // Settings takes the last folder away: files_live.set() rebuilds this way.
+    s.files_scope.clear();
+    s.built = 1;
+    s.rebuild();
+    // Empty means empty: no folder, no file row, and no answer can arrive.
+    try t.expectEqual(@as(usize, 0), s.found.n);
+    // A later query the stale row would have matched lists nothing either.
+    s.query.set("hol");
+    s.built = 1;
+    s.rebuild();
+    try t.expectEqual(@as(usize, 0), s.found.n);
+    // A folder added back searches again, from the query in the field.
+    _ = s.files_scope.add("~/Desktop");
+    s.built = 1;
+    s.rebuild();
+    try t.expectEqual(@as(usize, 0), s.found.n);
+}

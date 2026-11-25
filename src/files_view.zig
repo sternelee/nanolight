@@ -71,7 +71,9 @@ pub fn tile(s: *Nanolight, c: *ui.Context, p: Palette, r: Row) void {
 /// Retain matching rows while the worker answers the new query.
 pub fn rebuild(s: *Nanolight) void {
     const q = std.mem.trim(u8, s.query.text(), " \t\r\n");
-    if (files.available() and s.files_on and
+    // An empty scope searches nothing (files.find says so too): the last
+    // answer must not outlive the folders it came from.
+    if (files.available() and s.files_on and s.files_scope.count() > 0 and
         (files.isPath(q) or (files.eligible(q) and @import("calc.zig").eval(q) == null)))
     {
         s.found.filter(q);
