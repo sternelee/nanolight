@@ -43,6 +43,8 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkFramework("ServiceManagement", .{});
             // The Codegraff key, kept in the Keychain (src/keychain_mac.zig).
             exe.root_module.linkFramework("Security", .{});
+            // PDF text, read with PDFKit (src/pdf_extract.zig).
+            exe.root_module.linkFramework("PDFKit", .{});
         },
         .windows => {
             // A window app: no console. The hot key, the Start menu's icons,
@@ -77,6 +79,7 @@ pub fn build(b: *std.Build) void {
     const icons = b.addWriteFiles().addCopyFile(nanoui_dep.path("src/ui/icons.zig"), "icons.txt");
     tests.root_module.addAnonymousImport("nanoui_icons", .{ .root_source_file = icons });
     tests.root_module.addAnonymousImport("raycast_host", .{ .root_source_file = b.path("raycast/dist/host.js") });
+    if (os == .macos) tests.root_module.linkFramework("PDFKit", .{});
     if (os == .windows) for ([_][]const u8{ "user32", "gdi32", "shell32", "advapi32", "dwmapi", "ole32" }) |lib| tests.root_module.linkSystemLibrary(lib, .{});
     // zig-out/bin/nanolight-tests: the tests, to run on another machine.
     b.step("test-bin", "Install the tests as zig-out/bin/nanolight-tests").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = if (os == .windows) "nanolight-tests.exe" else "nanolight-tests" }).step);
