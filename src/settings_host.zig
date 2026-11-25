@@ -7,6 +7,29 @@ const account = @import("account.zig");
 const scope = @import("files_scope.zig");
 const Theme = @import("palette.zig").Theme;
 
+/// How an index build is going.
+pub const IndexState = struct {
+    running: bool = false,
+    files_seen: usize = 0,
+    files_indexed: usize = 0,
+    problem: []const u8 = "",
+};
+
+/// What Settings says about meaning search's model: whether it is here, and
+/// how far a download has got.
+pub const SemanticState = struct {
+    /// The switch: meaning search is on.
+    on: bool = false,
+    /// The model is whole on this computer.
+    ready: bool = false,
+    /// A download is running.
+    fetching: bool = false,
+    /// 0 to 1, of both files.
+    fraction: f64 = 0,
+    /// Why it stopped, when it did.
+    problem: []const u8 = "",
+};
+
 pub const SettingsHost = struct {
     ctx: *anyopaque,
     choice: *const fn (ctx: *anyopaque) shortcut.Choice,
@@ -22,6 +45,17 @@ pub const SettingsHost = struct {
     files: *const fn (ctx: *anyopaque, on: bool, locations: []const u8) void,
     /// The system's folder picker, adding what is chosen to the scope.
     folders: *const fn (ctx: *anyopaque, paths: *scope.Scope) void,
+    /// Meaning search turned on or off: kept, and the model fetched if it
+    /// is not here yet.
+    semantic: *const fn (ctx: *anyopaque, on: bool) void,
+    /// Whether the model is on this computer, and how its download is going.
+    semantic_state: *const fn (ctx: *anyopaque) SemanticState,
+    /// Starts (or retries) the model download.
+    semantic_fetch: *const fn (ctx: *anyopaque) void,
+    /// Builds the meaning index from the folders chosen.
+    semantic_index: *const fn (ctx: *anyopaque) void,
+    /// Whether an index build is running, and how far it got.
+    index_state: *const fn (ctx: *anyopaque) IndexState,
     /// Return sends Google searches to the browser (on) or the panel.
     searches_out: *const fn (ctx: *anyopaque, on: bool) void,
     /// The panel's tint, chosen in Settings: kept for the next launch.

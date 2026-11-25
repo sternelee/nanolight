@@ -25,6 +25,9 @@ pub const Kind = enum {
     currency,
     app,
     file,
+    /// A file found by meaning (`Row.meaning`): its vector was close to the
+    /// query's.
+    meaning,
     ask_grok,
     ask_claude,
     search_x,
@@ -43,6 +46,7 @@ pub const Kind = enum {
             .currency => "Currency",
             .app => "Application",
             .file => "File",
+            .meaning => "File",
             .settings => "Nanolight",
             .pane => "System Settings",
             .ask_grok, .ask_claude, .search_x, .search_web, .suggest => "Web",
@@ -56,6 +60,7 @@ pub const Kind = enum {
             .currency => "Copy Amount",
             .app => "Open Application",
             .file => "Open",
+            .meaning => "Open",
             .settings => "Open Settings",
             .pane => "Open in System Settings",
             .ask_grok => "Ask Grok",
@@ -70,6 +75,7 @@ pub const Kind = enum {
             .calc, .currency => "Calculator",
             .app => if (suggested) "Suggestions" else "Applications",
             .file => "Files",
+            .meaning => "Found by Meaning",
             .settings => "Nanolight",
             .pane => "System Settings",
             .search_web, .suggest => "Google",
@@ -83,6 +89,8 @@ pub const Row = struct {
     /// The app's index (`.app`).
     app: u32 = 0,
     file: u8 = 0,
+    /// Which of the meaning hits (`.meaning`).
+    meaning: u8 = 0,
     /// Which of the completions (`.suggest`).
     web: u8 = 0,
     /// Which of its name's bytes the query matched.
@@ -119,7 +127,7 @@ pub const Results = struct {
     /// Lists what `query` finds in the app index and files, with Google's
     /// completions (`web`), or
     /// `suggestions` when the query is empty.
-    pub fn build(r: *Results, query_in: []const u8, ix: *const Index, suggestions: []const u32, web: []const []const u8, found: *const files.List) void {
+    pub fn build(r: *Results, query_in: []const u8, ix: *const Index, suggestions: []const u32, web: []const []const u8, found: *const files.List, meaning: []const @import("vector_index.zig").Hit) void {
         const boost = ix.launches.items;
         r.n = 0;
         const query = std.mem.trim(u8, query_in, " ");
@@ -152,14 +160,15 @@ pub const Results = struct {
         // One row pays for each section head beyond the original three, so
         // a full list stays one length.
         const heads: usize = 2 + @as(usize, @intFromBool(n > 0)) + @as(usize, @intFromBool(np > 0)) +
-            @as(usize, @intFromBool(settings)) + @as(usize, @intFromBool(found.n > 0));
+            @as(usize, @intFromBool(settings)) + @as(usize, @intFromBool(found.n > 0)) +
+            @as(usize, @intFromBool(meaning.len > 0));
         const limit = max_rows -| (heads -| 3);
         // The web rows that always follow the apps: Google, Grok, X, and
         // Claude when it's on.
         const handoffs: usize = 3 + @as(usize, @intFromBool(r.claude));
         const fixed = handoffs + @as(usize, @intFromBool(settings));
         const first_pane: usize = @intFromBool(np > 0);
-        const file_row: usize = @intFromBool(found.n > 0);
+        const file_row: usize = @intFromBool(found.n > 0) + @as(usize, @intFromBool(meaning.len > 0));
         // Apps come first. Panes and files are sure of a row each and take
         // only what is left: a full list of apps ("hola") leaves room for
         // two panes, not three.
@@ -178,6 +187,10 @@ pub const Results = struct {
         if (!found.exact) for (0..count) |i| {
             r.push(.{ .kind = .file, .file = @intCast(i), .match = found.entries[i].match });
         };
+        // What meaning search found, under its own head: files whose words
+        // never matched, but whose content is close to what was asked.
+        const meaning_count = @min(meaning.len, limit -| fixed -| app_count -| pane_count -| count);
+        for (0..meaning_count) |i| r.push(.{ .kind = .meaning, .meaning = @intCast(i) });
         // The search for what was typed, its completions (as many as leave
         // room for the rest), then Grok, Claude if it's on, and X.
         const room = limit -| r.n -| handoffs;
@@ -219,7 +232,7 @@ pub fn url(buf: []u8, kind: Kind, query: []const u8) []const u8 {
         .ask_claude => "https://claude.ai/new?q=",
         .search_x => "https://x.com/search?f=live&q=",
         .search_web, .suggest => "https://www.google.com/search?q=",
-        .calc, .currency, .app, .file, .settings, .pane => return "",
+        .calc, .currency, .app, .file, .meaning, .settings, .pane => return "",
     };
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll(base) catch return "";
@@ -255,11 +268,11 @@ test "Claude's row is listed only when it's on, and gives its row back when not"
     const none: files.List = .{ .allocator = t.allocator };
     const web = [_][]const u8{ "a", "b", "c", "d" };
     var off: Results = .{};
-    off.build("liquid gl", &ix, &.{}, &web, &none);
+    off.build("liquid gl", &ix, &.{}, &web, &none, &.{});
     for (off.slice()) |row| try t.expect(row.kind != .ask_claude);
     try t.expectEqual(Kind.ask_grok, off.rows[off.n - 2].kind);
     var on: Results = .{ .claude = true };
-    on.build("liquid gl", &ix, &.{}, &web, &none);
+    on.build("liquid gl", &ix, &.{}, &web, &none, &.{});
     try t.expectEqual(Kind.ask_claude, on.rows[on.n - 2].kind);
     // With this few apps Google keeps all four either way.
     try t.expectEqual(off.n + 1, on.n);
@@ -270,13 +283,13 @@ test "currency is listed like math, without inventing a rate" {
     var ix = try testIndex(t.allocator, &.{"Safari"});
     defer ix.deinit();
     var r: Results = .{};
-    r.build("100 USD to EUR", &ix, &.{}, &.{}, &.{});
+    r.build("100 USD to EUR", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(Kind.currency, r.rows[0].kind);
     try t.expectEqual(@as(usize, 1), r.n); // no apps match "100 USD to EUR"
-    r.build("2^10 * 3", &ix, &.{}, &.{}, &.{});
+    r.build("2^10 * 3", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(Kind.calc, r.rows[0].kind);
     // Math wins over a currency-shaped string that also evaluates (none today).
-    r.build("safari", &ix, &.{}, &.{}, &.{});
+    r.build("safari", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expect(r.rows[0].kind != .currency);
 }
 
@@ -285,7 +298,7 @@ test "math first, then apps; ask and search only without an answer" {
     var ix = try testIndex(t.allocator, &.{ "Safari", "System Settings", "Calculator" });
     defer ix.deinit();
     var r: Results = .{ .claude = true };
-    r.build("saf", &ix, &.{}, &.{}, &.{});
+    r.build("saf", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(Kind.app, r.rows[0].kind);
     try t.expectEqual(@as(u32, 0), r.rows[0].app);
     try t.expectEqual(Kind.search_web, r.rows[r.n - 4].kind);
@@ -293,22 +306,22 @@ test "math first, then apps; ask and search only without an answer" {
     try t.expectEqualStrings("Google", r.section(1).?);
     try t.expectEqualStrings("Ask & Search", r.section(2).?);
     try t.expect(r.section(3) == null);
-    r.build("2^10 * 3", &ix, &.{}, &.{"ignored"}, &.{});
+    r.build("2^10 * 3", &ix, &.{}, &.{"ignored"}, &.{}, &.{});
     try t.expectEqual(Kind.calc, r.rows[0].kind);
     try t.expectEqualStrings("3,072", r.answer);
     try t.expectEqualStrings("0xC00", r.hex);
     try t.expectEqual(@as(usize, 1), r.n);
-    r.build("", &ix, &.{ 2, 0 }, &.{}, &.{});
+    r.build("", &ix, &.{ 2, 0 }, &.{}, &.{}, &.{});
     try t.expectEqual(@as(usize, 2), r.n);
     try t.expectEqualStrings("Suggestions", r.section(0).?);
-    r.build("liquid glass", &ix, &.{}, &.{}, &.{});
+    r.build("liquid glass", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(@as(usize, 4), r.n);
     // No app: the search for what was typed comes first.
     try t.expectEqual(Kind.search_web, r.rows[0].kind);
     try t.expectEqualStrings("Google", r.section(0).?);
     try t.expectEqualStrings("Ask & Search", r.section(1).?);
     // Completions under it, in the same section, then Grok, Claude and X.
-    r.build("liquid gl", &ix, &.{}, &.{ "liquid glass", "liquid glue" }, &.{});
+    r.build("liquid gl", &ix, &.{}, &.{ "liquid glass", "liquid glue" }, &.{}, &.{});
     try t.expectEqual(@as(usize, 6), r.n);
     try t.expectEqual(Kind.search_web, r.rows[0].kind);
     try t.expectEqual(Kind.suggest, r.rows[1].kind);
@@ -318,14 +331,14 @@ test "math first, then apps; ask and search only without an answer" {
     try t.expect(r.section(1) == null and r.section(2) == null);
     try t.expectEqualStrings("Ask & Search", r.section(3).?);
     // "settings": System Settings first, Nanolight's own a row under it.
-    r.build("settings", &ix, &.{}, &.{}, &.{});
+    r.build("settings", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(Kind.app, r.rows[0].kind);
     try t.expectEqual(@as(u32, 1), r.rows[0].app);
     try t.expectEqual(Kind.settings, r.rows[1].kind);
     // A full list of apps still ends with every handoff.
     var many_ix = try testIndex(t.allocator, &.{ "Safari", "Mail", "Maps", "Pages", "Calendar", "Calculator", "FaceTime" });
     defer many_ix.deinit();
-    r.build("a", &many_ix, &.{}, &.{ "a1", "a2", "a3", "a4" }, &.{});
+    r.build("a", &many_ix, &.{}, &.{ "a1", "a2", "a3", "a4" }, &.{}, &.{});
     try t.expectEqual(max_rows, r.n);
     try t.expectEqual(Kind.search_web, r.rows[max_apps].kind);
     try t.expectEqual(Kind.suggest, r.rows[max_apps + 1].kind);
@@ -344,7 +357,7 @@ test "System Settings' panes come under the apps and keep the list's length (#12
     var ix = try testIndex(t.allocator, &.{ "Safari", "System Settings", "Calculator" });
     defer ix.deinit();
     var r: Results = .{};
-    r.build("login items", &ix, &.{}, &.{ "login items mac", "login items windows", "login items iphone" }, &.{});
+    r.build("login items", &ix, &.{}, &.{ "login items mac", "login items windows", "login items iphone" }, &.{}, &.{});
     try t.expectEqual(Kind.pane, r.rows[0].kind);
     try t.expectEqualStrings("System Settings", r.section(0).?);
     try t.expectEqualStrings("Login Items & Extensions", panes.all[r.rows[0].app].name);
@@ -352,10 +365,10 @@ test "System Settings' panes come under the apps and keep the list's length (#12
     try t.expect(r.n <= max_rows - 1);
     // "settings" is Nanolight's own Settings and System Settings the app,
     // not every pane with "settings" in a word for it.
-    r.build("settings", &ix, &.{}, &.{}, &.{});
+    r.build("settings", &ix, &.{}, &.{}, &.{}, &.{});
     for (r.slice()) |row| try t.expect(row.kind != .pane);
     // Math lists no panes.
-    r.build("2+2", &ix, &.{}, &.{}, &.{});
+    r.build("2+2", &ix, &.{}, &.{}, &.{}, &.{});
     try t.expectEqual(@as(usize, 1), r.n);
 }
 
@@ -368,7 +381,7 @@ test "a full list of apps and three panes still fits, with every handoff" {
     defer ix.deinit();
     var r: Results = .{ .claude = true };
     const web = [_][]const u8{ "hola", "hotmail", "hoy", "horoscopo" };
-    r.build("ho", &ix, &.{}, &web, &.{});
+    r.build("ho", &ix, &.{}, &web, &.{}, &.{});
     var apps_n: usize = 0;
     var panes_n: usize = 0;
     for (r.slice()) |row| switch (row.kind) {
@@ -393,7 +406,7 @@ test "a full list of apps and three panes still fits, with every handoff" {
         var path: [64]u8 = undefined;
         found.add(try std.fmt.bufPrint(&path, "/tmp/ho{d}", .{i}), false, .{ .score = 1 });
     }
-    r.build("ho", &ix, &.{}, &web, &found);
+    r.build("ho", &ix, &.{}, &web, &found, &.{});
     var counts = std.enums.EnumArray(Kind, usize).initFill(0);
     for (r.slice()) |row| counts.set(row.kind, counts.get(row.kind) + 1);
     try t.expectEqual(@as(usize, max_apps - 2), counts.get(.app));

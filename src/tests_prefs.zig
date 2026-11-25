@@ -440,3 +440,40 @@ test "Ask Claude is off until Settings turns it on, and stays as it was left" {
     try std.testing.expect(!t.containsText("Ask Claude"));
     try std.testing.expect(s.sel < s.res.n);
 }
+
+test "the meaning page's Return works as a key and as a newline command" {
+    if (!mac) return error.SkipZigTest;
+    const settings = @import("settings_view.zig");
+    const gpa = std.testing.allocator;
+    var ix: Index = .init(gpa);
+    defer ix.deinit();
+    var prefs: tests.Prefs = .{};
+    prefs.init();
+    var s: view.Nanolight = .{ .index = &ix };
+    defer s.query.deinit();
+    s.host = prefs.host();
+    s.openSettings();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&s, view.Nanolight.view), .{ .width = view.width, .height = view.max_height, .dark = true });
+    defer t.deinit();
+    t.settle(1);
+
+    // Open the meaning page from the main rows.
+    try t.clickText("Search by Meaning");
+    t.settle(1);
+    try std.testing.expectEqual(settings.Page.meaning, s.settings_ui.page);
+    try std.testing.expect(t.hasText("Download Model"));
+
+    // A real key press starts the download.
+    t.key(.enter);
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 1), prefs.semantic_fetches);
+
+    // The field's newline command (another way Return arrives) also acts:
+    // the old code checked `input.key` here and missed this path entirely.
+    // Reset the mock's fetching flag so a second fetch is allowed.
+    prefs.semantic_fetching = false;
+    tests.press(&t, &.{.{ .command = .insert_newline }});
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 2), prefs.semantic_fetches);
+}

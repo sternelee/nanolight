@@ -112,7 +112,7 @@ fn measure(ix: *Index, query: []const u8) f64 {
     const runs = 2000;
     const t0 = CACurrentMediaTime();
     for (0..runs) |_| {
-        r.build(query, ix, sug[0..ns], &.{}, &none);
+        r.build(query, ix, sug[0..ns], &.{}, &none, &.{});
         std.mem.doNotOptimizeAway(&r);
     }
     return (CACurrentMediaTime() - t0) / runs * 1e6;

@@ -27,6 +27,15 @@ test {
     _ = @import("tests_prefs.zig");
     _ = @import("tests_files.zig");
     _ = @import("files_scope.zig");
+    _ = @import("vector_index.zig");
+    _ = @import("embed_model.zig");
+    _ = @import("model_download.zig");
+    _ = @import("embed_runtime.zig");
+    _ = @import("semantic_live.zig");
+    _ = @import("text_extract.zig");
+    _ = @import("pdf_extract.zig");
+    _ = @import("office_extract.zig");
+    _ = @import("index_builder.zig");
     _ = @import("files_scope_view.zig");
     _ = @import("row_window.zig");
     _ = @import("answers.zig");
@@ -304,6 +313,29 @@ const Steps = struct {
         p.applied = c;
     }
     fn fix(_: *anyopaque, _: shortcut.Clash) void {}
+    fn semanticSet(ctx: *anyopaque, on: bool) void {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        p.semantic_on = on;
+        p.semantic_sets += 1;
+    }
+    fn semanticState(ctx: *anyopaque) @import("settings_host.zig").SemanticState {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        return .{
+            .on = p.semantic_on,
+            .ready = p.semantic_ready,
+            .fetching = p.semantic_fetching,
+            .fraction = if (p.semantic_fetching) 0.5 else 0,
+        };
+    }
+    fn semanticFetch(ctx: *anyopaque) void {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        p.semantic_fetches += 1;
+        p.semantic_fetching = true;
+    }
+    fn semanticIndex(_: *anyopaque) void {}
+    fn indexState(_: *anyopaque) @import("settings_host.zig").IndexState {
+        return .{};
+    }
     fn filesSet(ctx: *anyopaque, on: bool, locations: []const u8) void {
         const p: *Steps = @ptrCast(@alignCast(ctx));
         p.files = on;
@@ -437,6 +469,12 @@ pub const Prefs = struct {
     files_len: usize = 0,
     files_sets: u8 = 0,
     pickers: u8 = 0,
+    /// Meaning search as Settings left it, and what its model is doing.
+    semantic_on: bool = false,
+    semantic_sets: u8 = 0,
+    semantic_fetches: u8 = 0,
+    semantic_ready: bool = false,
+    semantic_fetching: bool = false,
     box: SettingsHost = undefined,
 
     pub fn init(p: *Prefs) void {
@@ -449,6 +487,11 @@ pub const Prefs = struct {
             .suggest = suggestSet,
             .files = filesSet,
             .folders = pick,
+            .semantic = semanticSet,
+            .semantic_state = semanticState,
+            .semantic_fetch = semanticFetch,
+            .semantic_index = semanticIndex,
+            .index_state = indexState,
             .searches_out = searchesOut,
             .theme = themeSet,
             .menu_bar = menuBar,
@@ -492,6 +535,29 @@ pub const Prefs = struct {
     }
     fn suggestSet(ctx: *anyopaque, _: bool) void {
         @as(*Prefs, @ptrCast(@alignCast(ctx))).suggest_sets += 1;
+    }
+    fn semanticSet(ctx: *anyopaque, on: bool) void {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        p.semantic_on = on;
+        p.semantic_sets += 1;
+    }
+    fn semanticState(ctx: *anyopaque) @import("settings_host.zig").SemanticState {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        return .{
+            .on = p.semantic_on,
+            .ready = p.semantic_ready,
+            .fetching = p.semantic_fetching,
+            .fraction = if (p.semantic_fetching) 0.5 else 0,
+        };
+    }
+    fn semanticFetch(ctx: *anyopaque) void {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        p.semantic_fetches += 1;
+        p.semantic_fetching = true;
+    }
+    fn semanticIndex(_: *anyopaque) void {}
+    fn indexState(_: *anyopaque) @import("settings_host.zig").IndexState {
+        return .{};
     }
     fn filesSet(ctx: *anyopaque, on: bool, locations: []const u8) void {
         const p: *Prefs = @ptrCast(@alignCast(ctx));

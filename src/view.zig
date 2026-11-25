@@ -31,6 +31,9 @@ pub const Host = struct {
     /// Request a currency conversion, returned through `Nanolight.ratesAnswered`.
     rates: ?*const fn (ctx: *anyopaque, amount: f64, from: []const u8, to: []const u8) void = null,
     files: ?*const fn (ctx: *anyopaque, query: []const u8) void = null,
+    /// The query's vector, asked of the model: answered through
+    /// `Nanolight.meaningAnswered`.
+    meaning: ?*const fn (ctx: *anyopaque, query: []const u8) void = null,
     /// Shows a search's page in the panel, over `webArea`; null takes it
     /// away. Without it, searches open in the browser.
     preview: ?*const fn (ctx: *anyopaque, url: ?[]const u8) void = null,
@@ -77,6 +80,12 @@ pub const Palette = @import("palette.zig").Palette;
 pub const palette = @import("palette.zig").palette;
 pub const Theme = @import("palette.zig").Theme;
 
+/// How close a file has to be to count as a match for a query. Measured on
+/// EmbeddingGemma 2: a query and a document about the same thing score
+/// about 0.75-0.85, and unrelated ones about 0.45-0.55, so this sits in the
+/// gap. Below it, a search finds nothing rather than the least-bad file.
+pub const meaning_floor: f32 = 0.62;
+
 pub const Nanolight = struct {
     index: *Index,
     query: ui.TextBuffer = .{},
@@ -122,6 +131,16 @@ pub const Nanolight = struct {
     files_on: bool = false,
     files_scope: @import("files_scope.zig").Scope = .{},
     found: files.List = .{},
+    /// Meaning search: on, and the files its vectors found for the query.
+    /// The hits' paths are copied into `meaning_paths`: an index rebuild can
+    /// free the index bytes while these rows are still on screen.
+    meaning_on: bool = false,
+    meaning_hits: [8]@import("vector_index.zig").Hit = undefined,
+    meaning_paths: [8][@import("files.zig").max_path]u8 = undefined,
+    meaning_path_lens: [8]usize = @splat(0),
+    meaning_n: usize = 0,
+    meaning_query: [256]u8 = undefined,
+    meaning_query_len: usize = 0,
     /// Google's completions: whether to ask, those listed, the answers.
     suggest_on: bool = true,
     web: suggest.List = .{},
@@ -316,6 +335,42 @@ pub const Nanolight = struct {
         s.query.want_selection = .{ len, len };
     }
 
+    /// A query's vector came back: the files it is closest to, kept for the
+    /// rows. A score below `meaning_floor` is not a match, so a search for
+    /// something nobody has finds nothing rather than the least-bad file.
+    pub fn meaningAnswered(s: *Nanolight, q: []const u8, vec: *const [@import("vector_index.zig").dimension]f32, ix: *const @import("vector_index.zig").Index) void {
+        if (!s.meaning_on) return;
+        if (!std.mem.eql(u8, q, std.mem.trim(u8, s.query.text(), " \t\r\n"))) return;
+        const found = ix.search(vec, &s.meaning_hits);
+        // Copy each path out of the index before keeping it: the builder
+        // can replace and free the index on another thread at any moment.
+        // `keep` never passes the index being read, so writing the same
+        // array in place is safe.
+        var keep: usize = 0;
+        var i: usize = 0;
+        while (i < found) : (i += 1) {
+            const hit = s.meaning_hits[i];
+            // A score below the floor is not a match; hits are in score
+            // order, so the first one below ends the list.
+            if (hit.score < meaning_floor) break;
+            if (hit.path.len > s.meaning_paths[keep].len) continue;
+            @memcpy(s.meaning_paths[keep][0..hit.path.len], hit.path);
+            s.meaning_path_lens[keep] = hit.path.len;
+            s.meaning_hits[keep] = .{
+                .path = s.meaning_paths[keep][0..hit.path.len],
+                .kind = hit.kind,
+                .score = hit.score,
+            };
+            keep += 1;
+        }
+        s.meaning_n = keep;
+        const n = @min(q.len, s.meaning_query.len);
+        @memcpy(s.meaning_query[0..n], q[0..n]);
+        s.meaning_query_len = n;
+        s.built = 1;
+        s.rebuild();
+    }
+
     /// Rebuild changed queries, asking for missing completions.
     pub fn rebuild(s: *Nanolight) void {
         const q = s.query.text();
@@ -323,6 +378,16 @@ pub const Nanolight = struct {
         if (h == s.built) return;
         s.built = h;
         files_view.rebuild(s);
+        // Meaning search: a changed query asks the model for its vector,
+        // which comes back through `meaningAnswered`.
+        if (s.meaning_on) {
+            if (s.host) |host| if (host.meaning) |ask| {
+                const trimmed = std.mem.trim(u8, q, " \t\r\n");
+                if (trimmed.len >= 2 and @import("calc.zig").eval(trimmed) == null) ask(host.ctx, trimmed);
+            };
+        } else {
+            s.meaning_n = 0;
+        }
         const was = s.web;
         s.web.n = 0;
         const currency = @import("currency.zig");
@@ -357,7 +422,7 @@ pub const Nanolight = struct {
         const ns = s.index.suggestions(&sug);
         var web: [suggest.max_rows][]const u8 = undefined;
         s.res.claude = s.claude_on;
-        s.res.build(s.query.text(), s.index, sug[0..ns], s.web.slices(&web), &s.found);
+        s.res.build(s.query.text(), s.index, sug[0..ns], s.web.slices(&web), &s.found, s.meaning_hits[0..s.meaning_n]);
         if (s.res.n > 0 and s.res.rows[0].kind == .currency) {
             if (s.fx) |a| {
                 s.res.answer = @import("currency.zig").format(&s.res.answer_buf, a.value, true);
@@ -443,6 +508,13 @@ pub const Nanolight = struct {
         const q = s.query.text();
         switch (r.kind) {
             .calc, .currency => unreachable,
+            .meaning => {
+                const hit = s.meaning_hits[r.meaning];
+                ui.text(c, std.fs.path.basename(hit.path), .{ .size = 13.5, .weight = .medium, .color = p.text.alpha(0.82) });
+                var buf: [files.max_path]u8 = undefined;
+                ui.textf(c, .{ .size = 12, .color = p.sub.alpha(0.8), .truncate = .ellipsis }, "{s}", .{files.parent(&buf, hit.path)});
+                ui.text(c, "File", .{ .size = 11.5, .color = p.sub });
+            },
             .app => {
                 const a = s.index.apps.items[r.app];
                 ui.richText(c, a.name, s.highlight(i, r, p), .{ .size = 13.5, .weight = .medium, .color = p.text.alpha(0.82) });
@@ -580,6 +652,12 @@ pub const Nanolight = struct {
         if (s.res.n == 0) return;
         const r = s.res.rows[@min(s.sel, s.res.n - 1)];
         switch (r.kind) {
+            .meaning => {
+                const hit = s.meaning_hits[r.meaning];
+                if (s.host) |h| h.open(h.ctx, hit.path);
+                if (s.host) |h| h.hide(h.ctx);
+                return;
+            },
             .calc => {
                 var buf: [64]u8 = undefined;
                 const v = @import("calc.zig").eval(s.query.text()) orelse return;

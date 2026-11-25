@@ -17,16 +17,16 @@ const Choice = shortcut.Choice;
 const Palette = panel.Palette;
 const mac = @import("builtin").os.tag == .macos;
 
-const RowKind = enum { choice, suggest, files, folders, browser, claude, login, menu_bar, sync, terms, updates, welcome, quit, theme };
+const RowKind = enum { choice, suggest, files, folders, semantic, browser, claude, login, menu_bar, sync, terms, updates, welcome, quit, theme };
 const Theme = @import("palette.zig").Theme;
 
 /// Which page Settings shows: its rows, or the folders file search may use.
-pub const Page = enum { main, folders };
+pub const Page = enum { main, folders, meaning };
 
 /// As tall as its sections, never past the window. Tighter Mac spacing
 /// fits file search's folders, where searches open, Claude's row and the
 /// menu bar icon. The folders' page is as tall as its chips.
-const main_height: f32 = if (mac) 666 else 620;
+const main_height: f32 = if (mac) 666 else 656;
 
 pub const Settings = struct {
     open: bool = false,
@@ -72,6 +72,7 @@ pub const Settings = struct {
             .main => main_height,
             .folders => 198 + (files_scope_view.height(paths) - files_scope_view.chip_h) +
                 @as(f32, if (paths.count() == 0) 24 else 0),
+            .meaning => 262,
         };
     }
 
@@ -99,6 +100,7 @@ pub const Settings = struct {
 
     pub fn view(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
         if (s.page == .folders) return s.foldersPage(c, n, p);
+        if (s.page == .meaning) return s.meaningPage(c, n, p);
         s.pull(n);
         const rows = rowList(s.account);
         if (s.sel >= rows.len) s.sel = rows.len - 1;
@@ -155,6 +157,7 @@ pub const Settings = struct {
         s.switchRow(c, n, p, rows, .suggest, "Google Suggestions");
         if (mac) s.switchRow(c, n, p, rows, .files, "File Search");
         if (mac) s.folders(c, n, p, rows);
+        s.semanticRow(c, n, p, rows);
         if (mac) s.switchRow(c, n, p, rows, .browser, "Open Searches in Browser");
         s.switchRow(c, n, p, rows, .claude, "Ask Claude");
         label(c, p, "This " ++ @import("results.zig").machine);
@@ -229,7 +232,7 @@ pub const Settings = struct {
 
     fn switchRow(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette, rows: []const RowKind, kind: RowKind, title: []const u8) void {
         const on = isSel(rows, s.sel, kind);
-        const d = ui.div(c).row().wFull().h(if (mac) 32 else 36).px(4).gap(10).itemsCenter().rounded(10).control().bg(if (on) p.sel else p.fill.alpha(0));
+        const d = ui.div(c).row().wFull().h(if (mac) 30 else 34).px(4).gap(10).itemsCenter().rounded(10).control().bg(if (on) p.sel else p.fill.alpha(0));
         defer d.end();
         if (d.clicked()) s.flip(n, kind);
         ui.text(c, title, .{ .size = 13.5, .weight = .medium, .color = p.text });
@@ -251,7 +254,7 @@ pub const Settings = struct {
     fn folders(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette, rows: []const RowKind) void {
         const on = isSel(rows, s.sel, .folders);
         ui.key(c, "folders");
-        const d = ui.div(c).row().wFull().h(if (mac) 32 else 36).px(4).gap(10).itemsCenter().rounded(10).control()
+        const d = ui.div(c).row().wFull().h(if (mac) 30 else 34).px(4).gap(10).itemsCenter().rounded(10).control()
             .bg(if (on) p.sel else p.fill.alpha(0)).hover(p.sel);
         defer d.end();
         if (d.clicked()) s.activate(n, .folders);
@@ -264,6 +267,120 @@ pub const Settings = struct {
             ui.text(c, "1 folder", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
         } else ui.textf(c, .{ .size = 12.5, .color = p.sub.alpha(0.85) }, "{d} folders", .{count});
         ui.icon(c, "chevron.right", .{ .size = 9, .weight = .semibold, .color = p.sub.alpha(0.6) });
+    }
+
+    /// Meaning search, as a row under the folders: on or off, and what its
+    /// model is doing (here, downloading, or not fetched yet).
+    fn semanticRow(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette, rows: []const RowKind) void {
+        const on = isSel(rows, s.sel, .semantic);
+        ui.key(c, "semantic");
+        const d = ui.div(c).row().wFull().h(if (mac) 30 else 34).px(4).gap(10).itemsCenter().rounded(10).control()
+            .bg(if (on) p.sel else p.fill.alpha(0)).hover(p.sel);
+        defer d.end();
+        if (d.clicked()) s.activate(n, .semantic);
+        ui.text(c, "Search by Meaning", .{ .size = 13.5, .weight = .medium, .color = p.text });
+        ui.spacer(c);
+        const st = s.meaning(n);
+        if (!st.ready) {
+            ui.text(c, if (st.fetching) "Downloading…" else "Model not here", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        } else if (st.on) {
+            ui.text(c, "On", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        } else {
+            ui.text(c, "Off", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        }
+        ui.icon(c, "chevron.right", .{ .size = 9, .weight = .semibold, .color = p.sub.alpha(0.6) });
+    }
+
+    /// What the host says about the model, or nothing when there is no host.
+    fn meaning(s: *Settings, n: *panel.Nanolight) @import("settings_host.zig").SemanticState {
+        const h = s.hooks(n) orelse return .{};
+        return h.semantic_state(h.ctx);
+    }
+
+    /// The meaning page: the switch, what the model is doing, and the one
+    /// button that matters (fetch it, or turn it on).
+    fn meaningPage(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
+        const S = ui.Shortcut;
+        const h = s.hooks(n);
+        if (c.shortcut(.{ .key = S.escape })) {
+            s.page = .main;
+            n.query.focus();
+            return;
+        }
+        const st = s.meaning(n);
+        // Return is handled in `inPanel`, once for the whole panel: it may
+        // arrive as a key or as the field's newline command, and doing it
+        // here would miss the latter.
+        ui.key(c, "settings-meaning");
+        {
+            const bar = ui.div(c).row().wFull().h(panel.header_h).px(16).gap(10).itemsCenter();
+            defer bar.end();
+            {
+                const back = ui.div(c).row().size(26, 26).center().rounded(7).control().hover(p.sel);
+                if (back.clicked()) {
+                    s.page = .main;
+                    n.query.focus();
+                }
+                ui.icon(c, "chevron.left", .{ .size = 11, .weight = .semibold, .color = p.sub });
+                back.end();
+            }
+            ui.text(c, "Search by Meaning", .{ .size = 18, .weight = .semibold, .color = p.text, .tracking = -0.2 });
+            ui.spacer(c);
+            ui.text(c, if (st.ready) (if (st.on) "On" else "Off") else "Not set up", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        }
+        ui.div(c).wFull().h(1).bg(p.hair).end();
+        const col = ui.div(c).column().wFull().px(20).pt(16).gap(12).grow();
+        defer col.end();
+        ui.text(c, "Describe what you are looking for, in your own words: a photo, a page, a recording. " ++
+            "The model reads the files in the folders above, on this computer only.", .{ .size = 12.5, .color = p.sub });
+        {
+            const row = ui.div(c).row().wFull().gap(10).itemsCenter();
+            defer row.end();
+            var on = st.on;
+            if (ui.toggle(c, "Search by meaning", &on)) {
+                if (h) |host| host.semantic(host.ctx, on);
+                c.changed = true;
+            }
+            ui.spacer(c);
+            if (!st.ready) ui.text(c, "Needs the model", .{ .size = 12, .color = p.sub.alpha(0.8) });
+        }
+        if (!st.ready) {
+            ui.text(c, "EmbeddingGemma 2, 865 MB, downloaded once. It stays on this computer.", .{ .size = 12, .color = p.sub.alpha(0.8) });
+            if (st.fetching) {
+                const bar = ui.div(c).wFull().h(6).roundedFull().bg(p.tile);
+                defer bar.end();
+                const w: f32 = @floatCast(@max(0.02, st.fraction));
+                ui.div(c).h(6).w(560 * w).roundedFull().bg(p.text.alpha(0.7)).end();
+                ui.textf(c, .{ .size = 12, .color = p.sub }, "{d:.0}% of 865 MB", .{st.fraction * 100});
+            } else if (st.problem.len > 0) {
+                ui.text(c, st.problem, .{ .size = 12, .color = p.sub.alpha(0.9) });
+            }
+        } else {
+            ui.text(c, "The model is here. Build an index to search by what files say.", .{ .size = 12, .color = p.sub.alpha(0.8) });
+            const ix: @import("settings_host.zig").IndexState = if (h) |host| host.index_state(host.ctx) else .{};
+            if (ix.running) {
+                ui.textf(c, .{ .size = 12, .color = p.sub }, "Reading {d} files, indexed {d}…", .{ ix.files_seen, ix.files_indexed });
+            } else if (ix.problem.len > 0) {
+                ui.text(c, ix.problem, .{ .size = 12, .color = p.sub.alpha(0.9) });
+            } else if (ix.files_indexed > 0) {
+                ui.textf(c, .{ .size = 12, .color = p.sub }, "Indexed {d} files.", .{ix.files_indexed});
+            }
+            const build = ui.div(c).row().wFull().h(32).px(12).itemsCenter().rounded(10).control().bg(p.tile).hover(p.sel);
+            defer build.end();
+            if (build.clicked()) {
+                if (h) |host| host.semantic_index(host.ctx);
+                c.changed = true;
+            }
+            ui.text(c, if (ix.running) "Indexing…" else "Build Index", .{ .size = 13, .weight = .medium, .color = p.text });
+        }
+        ui.div(c).wFull().h(1).bg(p.hair).end();
+        const bar = ui.div(c).row().wFull().h(panel.footer_h).px(16).gap(8).itemsCenter();
+        defer bar.end();
+        ui.text(c, if (!st.ready) (if (st.fetching) "Downloading" else "Download Model") else "Turn On", .{ .size = 12, .weight = .medium, .color = p.text.alpha(0.85) });
+        ui.kbd(c, "↩");
+        ui.div(c).w(1).h(14).bg(p.hair).end();
+        ui.text(c, "Back", .{ .size = 12, .color = p.sub.alpha(0.8) });
+        ui.kbd(c, "esc");
     }
 
     /// The folders page: what file search looks in, a chip each (its × takes
@@ -456,6 +573,19 @@ pub const Settings = struct {
                     if (s.hooks(n)) |host| host.folders(host.ctx, &n.files_scope);
                     c.changed = true;
                 },
+                .meaning => {
+                    // The one thing this page is for: fetch the model, or
+                    // turn the switch over once it is here.
+                    const st = s.meaning(n);
+                    if (s.hooks(n)) |host| {
+                        if (st.ready) {
+                            host.semantic(host.ctx, !st.on);
+                        } else if (!st.fetching) {
+                            host.semantic_fetch(host.ctx);
+                        }
+                    }
+                    c.changed = true;
+                },
                 .main => s.activateSelected(n),
             }
         }
@@ -494,6 +624,7 @@ pub const Settings = struct {
             // ←/→ step through the four; Return records one's own.
             .choice => if (mac) s.record(n, !s.recording) else s.nudge(n, rowList(s.account), 1),
             .suggest, .files, .browser, .claude, .login, .menu_bar => s.flip(n, kind),
+            .semantic => s.page = .meaning,
             .folders => s.page = .folders,
             .sync => if (h) |host| switch (s.account) {
                 .signed_out => host.sign_in(host.ctx),
@@ -526,8 +657,8 @@ pub fn loadClaude(kv: nanoui.kv.Store, gpa: std.mem.Allocator) bool {
 
 fn rowList(state: account.State) []const RowKind {
     return switch (state) {
-        .signed_out, .starting => if (mac) &.{ .choice, .suggest, .files, .folders, .browser, .claude, .login, .menu_bar, .sync, .terms, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .terms, .updates, .welcome, .quit, .theme },
-        .waiting, .signed_in => if (mac) &.{ .choice, .suggest, .files, .folders, .browser, .claude, .login, .menu_bar, .sync, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .updates, .welcome, .quit, .theme },
+        .signed_out, .starting => if (mac) &.{ .choice, .suggest, .files, .folders, .semantic, .browser, .claude, .login, .menu_bar, .sync, .terms, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .semantic, .claude, .login, .sync, .terms, .updates, .welcome, .quit, .theme },
+        .waiting, .signed_in => if (mac) &.{ .choice, .suggest, .files, .folders, .semantic, .browser, .claude, .login, .menu_bar, .sync, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .semantic, .claude, .login, .sync, .updates, .welcome, .quit, .theme },
     };
 }
 

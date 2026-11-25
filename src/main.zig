@@ -77,6 +77,8 @@ pub const Live = struct {
     asking_len: usize = 0,
     waiting: u32 = 0,
     files: @import("files_live.zig").State = .{},
+    meaning: @import("semantic_live.zig").State = .{},
+    meaning_indexing: @import("index_builder.zig").Progress = .{},
     /// Updates from GitHub's releases (a signed build only), and the menu
     /// bar icon whose menu offers one once it's ready.
     updater: ?*nanoui.Updater = null,
@@ -101,7 +103,7 @@ pub const Live = struct {
     fn host(l: *Live) view.Host {
         const bind = @import("settings_bind.zig");
         bind.box.ctx = l;
-        return .{ .ctx = l, .open = open, .hide = hide, .resize = resize, .suggest = ask, .rates = askRates, .files = if (mac) @import("files_live.zig").askFiles else null, .preview = if (mac) showPage else null, .settings = &bind.box };
+        return .{ .ctx = l, .open = open, .hide = hide, .resize = resize, .suggest = ask, .rates = askRates, .files = if (mac) @import("files_live.zig").askFiles else null, .meaning = @import("semantic_live.zig").ask, .preview = if (mac) showPage else null, .settings = &bind.box };
     }
 
     fn open(ctx: *anyopaque, target: []const u8) void {
@@ -448,6 +450,33 @@ pub const Live = struct {
         @import("files_live.zig").choose(ctx, scope);
     }
 
+    /// Meaning search turned on or off in Settings: kept.
+    pub fn meaningSet(ctx: *anyopaque, on: bool) void {
+        @import("semantic_live.zig").set(ctx, on);
+    }
+
+    /// Whether the model is here, and how its download is going.
+    pub fn meaningState(ctx: *anyopaque) @import("settings_host.zig").SemanticState {
+        return @import("semantic_live.zig").state(ctx);
+    }
+
+    /// Starts (or retries) the model download.
+    pub fn meaningFetch(ctx: *anyopaque) void {
+        @import("semantic_live.zig").fetch(ctx);
+    }
+
+    /// Builds (or rebuilds) the meaning index from the folders chosen.
+    pub fn meaningIndex(ctx: *anyopaque) void {
+        _ = @import("index_builder.zig").Job.start(ctx);
+    }
+
+    /// How an index build is going.
+    pub fn indexState(ctx: *anyopaque) @import("settings_host.zig").IndexState {
+        const l: *Live = @ptrCast(@alignCast(ctx));
+        const p = l.meaning_indexing;
+        return .{ .running = p.running, .files_seen = p.files_seen, .files_indexed = p.files_indexed, .problem = p.problem };
+    }
+
     /// `nanolight --toggle`, or a newer copy starting (single.zig).
     fn command(ctx: *anyopaque, cmd: single.Command) void {
         const l: *Live = @ptrCast(@alignCast(ctx));
@@ -609,6 +638,7 @@ pub fn main(init: std.process.Init) !void {
     var live: Live = .{ .app = app, .s = &s, .o = &o, .kv = kv, .choice = shortcut.load(kv, init.gpa) };
     s.host = live.host();
     @import("files_live.zig").load(&live);
+    @import("semantic_live.zig").load(&live);
     // Google's completions are on unless turned off in Settings.
     if (kv.get(init.gpa, suggest_key) catch null) |v| {
         defer init.gpa.free(v);
