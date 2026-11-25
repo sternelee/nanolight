@@ -1,10 +1,12 @@
 //! The first run, inside the panel itself: no tour, no permissions (Carbon's
-//! hot keys need none). Three steps, each one thing to do:
+//! hot keys need none). Four steps, each one thing to do:
 //!   1. the shortcut: ⌘Space by default, and who else holds it, by name,
 //!      with the one thing that frees it;
 //!   2. press it for real: the panel closes, and comes back on the second
 //!      press — nothing advances on a button;
-//!   3. a first search to run, where Nanolight lives (the menu bar), and
+//!   3. file search: on or off, and the folders it may look in (chosen with
+//!      the system's picker, kept as they change);
+//!   4. a first search to run, where Nanolight lives (the menu bar), and
 //!      whether it opens at login.
 //! Esc skips at any step and it stays skipped; the menu bar icon replays it.
 const std = @import("std");
@@ -14,11 +16,14 @@ const motion = ui.motion;
 const panel = @import("view.zig");
 const shortcut = @import("shortcut.zig");
 const results = @import("results.zig");
+const files = @import("files.zig");
+const files_scope = @import("files_scope.zig");
+const files_scope_view = @import("files_scope_view.zig");
 const mac = @import("builtin").os.tag == .macos;
 const Choice = shortcut.Choice;
 const Palette = panel.Palette;
 
-pub const Step = enum { key, try_it, done };
+pub const Step = enum { key, try_it, files, done };
 
 /// What the steps ask of the app: none of it is done from a test.
 pub const Hooks = struct {
@@ -29,6 +34,10 @@ pub const Hooks = struct {
     fix: *const fn (ctx: *anyopaque, clash: shortcut.Clash) void,
     /// Whether it opens at login; `set` changes it first.
     login: ?*const fn (ctx: *anyopaque, set: ?bool) bool = null,
+    /// File search as the files step left it: kept from now on.
+    files: ?*const fn (ctx: *anyopaque, on: bool, locations: []const u8) void = null,
+    /// The system's folder picker, adding what is chosen to the scope.
+    folders: ?*const fn (ctx: *anyopaque, scope: *files_scope.Scope) void = null,
     /// The welcome is over: keep that.
     done: *const fn (ctx: *anyopaque) void,
 };
@@ -59,6 +68,9 @@ pub const Onboard = struct {
     reopened: bool = false,
     reopened_at: ?f64 = null,
     login: bool = false,
+    /// The files step kept something: a welcome skipped before it puts back
+    /// what file search was, rather than leaving this run's default on.
+    files_saved: bool = false,
 
     pub fn start(o: *Onboard, choice: Choice) void {
         o.active = true;
@@ -67,6 +79,7 @@ pub const Onboard = struct {
         o.closed = false;
         o.reopened = false;
         o.reopened_at = null;
+        o.files_saved = false;
         o.refresh();
     }
 
@@ -89,11 +102,13 @@ pub const Onboard = struct {
         if (visible) o.closed = true else if (o.closed) o.reopened = true;
     }
 
-    pub fn height(o: *const Onboard) f32 {
+    pub fn height(o: *const Onboard, s: *const panel.Nanolight) f32 {
         const c = o.clash();
         return switch (o.step) {
             .key => 330 + @as(f32, if (c.clear()) 0 else 30),
             .try_it => 318,
+            // The folders wrap three a row: the step grows with them.
+            .files => 246 + (files_scope_view.height(&s.files_scope) - files_scope_view.chip_h),
             .done => if (o.hooks != null and o.hooks.?.login != null) 396 else 350,
         };
     }
@@ -111,6 +126,7 @@ pub const Onboard = struct {
         switch (o.step) {
             .key => o.keyStep(c, p, enter),
             .try_it => o.tryStep(c, p),
+            .files => o.filesStep(c, s, p, enter),
             .done => o.doneStep(c, s, p, enter),
         }
         page.end();
@@ -207,8 +223,8 @@ pub const Onboard = struct {
                 o.reopened_at = c.time;
                 break :blk c.time;
             };
-            // Both ticks show for a moment, then the last step.
-            if (c.time - at > 0.75) return o.next(c, .done);
+            // Both ticks show for a moment, then the file step.
+            if (c.time - at > 0.75) return o.next(c, .files);
             c.animationFrame();
         }
         const col = ui.div(c).column().wFull().pt(34).gap(18).itemsCenter();
@@ -241,6 +257,74 @@ pub const Onboard = struct {
         defer ticks.end();
         tick(c, p, "Closed", o.closed);
         tick(c, p, "Back again", o.reopened);
+    }
+
+    /// Step 3: file search on or off, and the folders it may look in. What
+    /// changes here is kept at once, so skipping out still keeps it.
+    fn filesStep(o: *Onboard, c: *ui.Context, s: *panel.Nanolight, p: Palette, enter: bool) void {
+        const ready = files.available();
+        const picker: ?*const fn (ctx: *anyopaque, scope: *files_scope.Scope) void = if (o.hooks) |h| h.folders else null;
+        // ⌘O adds a folder, so this step is not a mouse-only one; Space turns
+        // it on or off; Return moves on, as every step's does, keeping the
+        // switch and folders as they are shown.
+        if (ready and picker != null and c.shortcut(.{ .key = 'o', .cmd = true })) {
+            picker.?(o.hooks.?.ctx, &s.files_scope);
+            o.saveFiles(s);
+            c.changed = true;
+        }
+        if (ready and c.shortcut(.{ .key = ' ' })) {
+            s.files_on = !s.files_on;
+            o.saveFiles(s);
+            c.changed = true;
+        }
+        if (enter) {
+            o.saveFiles(s);
+            return o.next(c, .done);
+        }
+        {
+            const top = ui.div(c).column().wFull().px(28).pt(26).pb(14).gap(4);
+            defer top.end();
+            ui.text(c, "Find files as you type", .{ .size = 22, .weight = .semibold, .color = p.text, .tracking = -0.3 });
+            ui.text(c, if (ready) "Spotlight's index, on this Mac only: names never leave it." else "File search needs Spotlight: not on this computer.", .{ .size = 13.5, .color = p.sub });
+        }
+        const body = ui.div(c).column().wFull().px(28).gap(12).grow();
+        defer body.end();
+        if (!ready) return;
+        {
+            const row = ui.div(c).row().wFull().gap(10).itemsCenter();
+            defer row.end();
+            if (ui.toggle(c, "Search files as you type", &s.files_on)) o.saveFiles(s);
+            ui.spacer(c);
+            const n = s.files_scope.count();
+            ui.textf(c, .{ .size = 12, .color = p.sub.alpha(0.8) }, "{d} folder{s}", .{ n, if (n == 1) "" else "s" });
+        }
+        {
+            const label = ui.div(c).row().wFull().gap(6).itemsCenter();
+            defer label.end();
+            ui.text(c, "Search in", .{ .size = 11.5, .weight = .semibold, .color = p.sub.alpha(0.85) });
+            ui.spacer(c);
+            // No folders is a real state: say what it means, and how a folder
+            // gets there without a mouse.
+            if (s.files_scope.count() == 0) {
+                ui.text(c, "Nothing is searched until you add one.", .{ .size = 11.5, .color = p.sub.alpha(0.7) });
+            } else if (picker != null) {
+                ui.text(c, "Add a folder", .{ .size = 11.5, .color = p.sub.alpha(0.7) });
+                ui.kbd(c, if (mac) "⌘O" else "Ctrl+O");
+            }
+        }
+        var act: ?files_scope_view.Actions = null;
+        if (o.hooks) |h| {
+            if (h.folders) |f| act = .{ .ctx = h.ctx, .add = f };
+        }
+        if (files_scope_view.chips(c, p, &s.files_scope, act)) o.saveFiles(s);
+    }
+
+    /// File search as the step left it: the switch and the folders, kept.
+    fn saveFiles(o: *Onboard, s: *panel.Nanolight) void {
+        const h = o.hooks orelse return;
+        const f = h.files orelse return;
+        o.files_saved = true;
+        f(h.ctx, s.files_on, s.files_scope.text());
     }
 
     fn cap(c: *ui.Context, p: Palette, str: []const u8, w: f32, lit: bool) void {
@@ -305,12 +389,14 @@ pub const Onboard = struct {
         const bar = ui.div(c).row().wFull().h(38).px(16).gap(8).itemsCenter();
         defer bar.end();
         const n: usize = @intFromEnum(o.step);
-        for (0..3) |i| ui.div(c).w(if (i == n) 16 else 6).h(6).roundedFull().bg(if (i == n) p.text.alpha(0.7) else p.sub.alpha(0.3)).end();
-        ui.textf(c, .{ .size = 12, .color = p.sub.alpha(0.8), .tabular = true }, "  {d} of 3", .{n + 1});
+        const steps = @typeInfo(Step).@"enum".field_names.len;
+        for (0..steps) |i| ui.div(c).w(if (i == n) 16 else 6).h(6).roundedFull().bg(if (i == n) p.text.alpha(0.7) else p.sub.alpha(0.3)).end();
+        ui.textf(c, .{ .size = 12, .color = p.sub.alpha(0.8), .tabular = true }, "  {d} of {d}", .{ n + 1, steps });
         ui.spacer(c);
         const action: []const u8 = switch (o.step) {
             .key => if (o.clash().clear()) "Continue" else c.print("Use {f} anyway", .{o.choice}),
             .try_it => "",
+            .files => if (files.available()) "Continue" else "Skip",
             .done => "Start searching",
         };
         if (action.len > 0) {

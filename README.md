@@ -13,6 +13,7 @@ Apps, math, Google, Grok, X and Raycast extensions: one keystroke away. Native Z
 - **Finds apps as you type**: whole names, starts of words, initials (`ss` is System Settings), letters in order, and typos (`chorme` is Chrome). What you open often climbs.
 - **System Settings panes** (Mac): "login items", "wifi" or "dark mode" lists the pane, under the apps, and Return opens System Settings right at it.
 - **Completes inline**: the rest of the top app's name, or of Google's top suggestion, is drawn faintly after the caret. Tab or → takes it; Return never does.
+- **Finds files too** (Mac, once you allow it): names from Spotlight's index, in the folders you pick in the welcome or Settings — Desktop, Documents and Downloads to begin with — and nowhere else. A path typed in full (`~/Desktop/`) lists that folder without any index.
 - **Does math**: `2^10 * 3` answers 3,072 (and `0xC00`). Return copies it.
 - **Converts currency**: `100 USD to EUR` (or `100usd in sgd`) uses [Frankfurter](https://www.frankfurter.app)'s ECB daily rates. Return copies the amount. Offline or a failed fetch shows that the rates are away — never a made-up number.
 - **Google suggestions**: up to four, under the apps, the words you add in bold. Nothing that reads as an address (a dot, a slash, an @) is sent.
@@ -83,6 +84,8 @@ cd raycast && npm test              # the Raycast extensions' host
 | `src/currency.zig` | Currency: parse `100 USD to EUR`, Frankfurter/ECB rates |
 | `src/suggest.zig` | Google's completions: the privacy guard, decoding, the cache (after [browse](https://github.com/justrach/browse)) |
 | `src/preview.zig` | The results page in the panel (WKWebView, the Mac) |
+| `src/files.zig`, `src/files_live.zig` | File search by name: the tiered Spotlight queries, path completion, exclusions ([docs/file-search.md](docs/file-search.md)) |
+| `src/files_scope.zig`, `src/files_scope_view.zig` | The folders file search may look in, and their chips in the welcome and Settings |
 | `src/panel_mac.zig`, `src/panel_pc.zig` | The panel's window on the Mac, and on Windows and Linux |
 | `src/linux_theme.zig` | Linux: the panel's colors, corners and font from an optional `~/.config/nanolight/theme.json`, else dark when gsettings says so |
 | `src/hotkey*.zig`, `src/apps_*.zig`, `src/single*.zig`, `src/login.zig`, `src/keychain*.zig` | Each platform's key, apps, single copy, login item and secret |

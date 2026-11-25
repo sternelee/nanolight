@@ -117,8 +117,10 @@ pub const Nanolight = struct {
     note: []const u8 = "",
     /// The first-run welcome, drawn while it is active.
     onboard: ?*@import("onboard.zig").Onboard = null,
-    /// Local file search is opt-in on this Mac.
+    /// Local file search is opt-in on this Mac, in the folders
+    /// `files_scope` names (files_scope.zig).
     files_on: bool = false,
+    files_scope: @import("files_scope.zig").Scope = .{},
     found: files.List = .{},
     /// Google's completions: whether to ask, those listed, the answers.
     suggest_on: bool = true,
@@ -152,7 +154,7 @@ pub const Nanolight = struct {
 
     /// The panel's height for what it shows.
     pub fn height(s: *const Nanolight) f32 {
-        if (s.settings_ui.open) return settings_view.height;
+        if (s.settings_ui.open) return s.settings_ui.height(&s.files_scope);
         if (s.ext) |e| if (e.open) return e.height();
         if (s.previewing) return max_height;
         return rows_height;
@@ -185,7 +187,7 @@ pub const Nanolight = struct {
         }
         defer shell.end();
         if (s.onboard) |o| if (o.active) {
-            const h = s.follow(o.height());
+            const h = s.follow(o.height(s));
             const body = ui.div(c).column().wFull().h(h).clip();
             defer body.end();
             o.view(c, s, p);

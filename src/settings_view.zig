@@ -11,20 +11,26 @@ const ui = nanoui.ui;
 const panel = @import("view.zig");
 const shortcut = @import("shortcut.zig");
 const account = @import("account.zig");
+const files_scope_view = @import("files_scope_view.zig");
 const SettingsHost = @import("settings_host.zig").SettingsHost;
 const Choice = shortcut.Choice;
 const Palette = panel.Palette;
 const mac = @import("builtin").os.tag == .macos;
 
-const RowKind = enum { choice, suggest, files, browser, claude, login, menu_bar, sync, terms, updates, welcome, quit, theme };
+const RowKind = enum { choice, suggest, files, folders, browser, claude, login, menu_bar, sync, terms, updates, welcome, quit, theme };
 const Theme = @import("palette.zig").Theme;
 
+/// Which page Settings shows: its rows, or the folders file search may use.
+pub const Page = enum { main, folders };
+
 /// As tall as its sections, never past the window. Tighter Mac spacing
-/// fits file search, where searches open, Claude's row and the menu bar icon.
-pub const height: f32 = if (mac) 666 else 620;
+/// fits file search's folders, where searches open, Claude's row and the
+/// menu bar icon. The folders' page is as tall as its chips.
+const main_height: f32 = if (mac) 666 else 620;
 
 pub const Settings = struct {
     open: bool = false,
+    page: Page = .main,
     sel: usize = 0,
     /// Return already handled for this key event (a frame may draw twice).
     took_return: bool = false,
@@ -50,11 +56,23 @@ pub const Settings = struct {
     pub fn show(s: *Settings) void {
         s.open = true;
         s.sel = 0;
+        s.page = .main;
     }
 
     pub fn hide(s: *Settings) void {
         s.open = false;
         s.recording = false;
+        s.page = .main;
+    }
+
+    /// The panel's height for the page it shows: the folders' page grows
+    /// with its chips, three a row, and says more when there are none.
+    pub fn height(s: *const Settings, paths: *const @import("files_scope.zig").Scope) f32 {
+        return switch (s.page) {
+            .main => main_height,
+            .folders => 198 + (files_scope_view.height(paths) - files_scope_view.chip_h) +
+                @as(f32, if (paths.count() == 0) 24 else 0),
+        };
     }
 
     fn hooks(s: *Settings, n: *panel.Nanolight) ?*const SettingsHost {
@@ -80,6 +98,7 @@ pub const Settings = struct {
     }
 
     pub fn view(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
+        if (s.page == .folders) return s.foldersPage(c, n, p);
         s.pull(n);
         const rows = rowList(s.account);
         if (s.sel >= rows.len) s.sel = rows.len - 1;
@@ -128,13 +147,14 @@ pub const Settings = struct {
     }
 
     fn body(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette, rows: []const RowKind) void {
-        const col = ui.div(c).column().wFull().px(20).pt(2).pb(6).gap(if (mac) 6 else 10).grow();
+        const col = ui.div(c).column().wFull().px(20).pt(2).pb(6).gap(if (mac) 4 else 10).grow();
         defer col.end();
         label(c, p, "Open Nanolight with");
         s.choices(c, n, p);
         label(c, p, "Search");
         s.switchRow(c, n, p, rows, .suggest, "Google Suggestions");
         if (mac) s.switchRow(c, n, p, rows, .files, "File Search");
+        if (mac) s.folders(c, n, p, rows);
         if (mac) s.switchRow(c, n, p, rows, .browser, "Open Searches in Browser");
         s.switchRow(c, n, p, rows, .claude, "Ask Claude");
         label(c, p, "This " ++ @import("results.zig").machine);
@@ -225,6 +245,83 @@ pub const Settings = struct {
         });
     }
 
+    /// The folders file search may use, as a row under its switch: the
+    /// count and a chevron, the chips a page of their own (the panel has no
+    /// room for them here, and they wrap).
+    fn folders(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette, rows: []const RowKind) void {
+        const on = isSel(rows, s.sel, .folders);
+        ui.key(c, "folders");
+        const d = ui.div(c).row().wFull().h(if (mac) 32 else 36).px(4).gap(10).itemsCenter().rounded(10).control()
+            .bg(if (on) p.sel else p.fill.alpha(0)).hover(p.sel);
+        defer d.end();
+        if (d.clicked()) s.activate(n, .folders);
+        ui.text(c, "Search Files In", .{ .size = 13.5, .weight = .medium, .color = p.text });
+        ui.spacer(c);
+        const count = n.files_scope.count();
+        if (count == 0) {
+            ui.text(c, "None yet", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        } else if (count == 1) {
+            ui.text(c, "1 folder", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+        } else ui.textf(c, .{ .size = 12.5, .color = p.sub.alpha(0.85) }, "{d} folders", .{count});
+        ui.icon(c, "chevron.right", .{ .size = 9, .weight = .semibold, .color = p.sub.alpha(0.6) });
+    }
+
+    /// The folders page: what file search looks in, a chip each (its × takes
+    /// it out), the picker on Return or its own chip, and Back on Esc.
+    fn foldersPage(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
+        const S = ui.Shortcut;
+        const h = s.hooks(n);
+        if (c.shortcut(.{ .key = S.escape })) {
+            s.page = .main;
+            n.query.focus();
+            return;
+        }
+        if (c.shortcut(.{ .key = S.enter })) {
+            if (h) |host| host.folders(host.ctx, &n.files_scope);
+            c.changed = true;
+        }
+        ui.key(c, "settings-folders");
+        {
+            const bar = ui.div(c).row().wFull().h(panel.header_h).px(16).gap(10).itemsCenter();
+            defer bar.end();
+            {
+                const back = ui.div(c).row().size(26, 26).center().rounded(7).control().hover(p.sel);
+                if (back.clicked()) {
+                    s.page = .main;
+                    n.query.focus();
+                }
+                ui.icon(c, "chevron.left", .{ .size = 11, .weight = .semibold, .color = p.sub });
+                back.end();
+            }
+            ui.text(c, "Search Files In", .{ .size = 18, .weight = .semibold, .color = p.text, .tracking = -0.2 });
+            ui.spacer(c);
+            const count = n.files_scope.count();
+            if (count == 0) {
+                ui.text(c, "None yet", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+            } else if (count == 1) {
+                ui.text(c, "1 folder", .{ .size = 12.5, .color = p.sub.alpha(0.85) });
+            } else ui.textf(c, .{ .size = 12.5, .color = p.sub.alpha(0.85) }, "{d} folders", .{count});
+        }
+        ui.div(c).wFull().h(1).bg(p.hair).end();
+        const col = ui.div(c).column().wFull().px(20).pt(16).gap(10).grow();
+        defer col.end();
+        ui.text(c, "Nanolight searches these folders, and nothing else. Spotlight's index, on this Mac.", .{ .size = 12.5, .color = p.sub });
+        var act: ?files_scope_view.Actions = null;
+        if (h) |host| act = .{ .ctx = host.ctx, .add = host.folders };
+        if (files_scope_view.chips(c, p, &n.files_scope, act)) {
+            if (h) |host| host.files(host.ctx, n.files_on, n.files_scope.text());
+        }
+        if (n.files_scope.count() == 0) ui.text(c, "With no folder, a search finds no files: only apps and the web.", .{ .size = 12, .color = p.sub.alpha(0.8) });
+        ui.div(c).wFull().h(1).bg(p.hair).end();
+        const bar = ui.div(c).row().wFull().h(panel.footer_h).px(16).gap(8).itemsCenter();
+        defer bar.end();
+        ui.text(c, "Add Folder", .{ .size = 12, .weight = .medium, .color = p.text.alpha(0.85) });
+        ui.kbd(c, "↩");
+        ui.div(c).w(1).h(14).bg(p.hair).end();
+        ui.text(c, "Back", .{ .size = 12, .color = p.sub.alpha(0.8) });
+        ui.kbd(c, "esc");
+    }
+
     /// A quiet on/off mark. Not `ui.toggle`: that flips on its own click,
     /// and this row already does.
     fn mark(c: *ui.Context, p: Palette, on: bool) void {
@@ -250,7 +347,7 @@ pub const Settings = struct {
                 n.files_on = !n.files_on;
                 s.files = n.files_on;
                 n.built = 1;
-                if (n.kv) |kv| kv.set(@import("files.zig").enabled_key, if (n.files_on) "1" else "0") catch {};
+                if (h) |host| host.files(host.ctx, n.files_on, n.files_scope.text());
             },
             .browser => {
                 n.searches_out = !n.searches_out;
@@ -355,7 +452,7 @@ pub const Settings = struct {
             s.took_return = true;
             s.activateSelected(n);
         }
-        const h = n.follow(height);
+        const h = n.follow(s.height(&n.files_scope));
         const box = ui.div(c).column().wFull().h(h).clip();
         defer box.end();
         s.view(c, n, p);
@@ -390,6 +487,7 @@ pub const Settings = struct {
             // ←/→ step through the four; Return records one's own.
             .choice => if (mac) s.record(n, !s.recording) else s.nudge(n, rowList(s.account), 1),
             .suggest, .files, .browser, .claude, .login, .menu_bar => s.flip(n, kind),
+            .folders => s.page = .folders,
             .sync => if (h) |host| switch (s.account) {
                 .signed_out => host.sign_in(host.ctx),
                 .waiting, .signed_in => host.sign_out(host.ctx),
@@ -421,8 +519,8 @@ pub fn loadClaude(kv: nanoui.kv.Store, gpa: std.mem.Allocator) bool {
 
 fn rowList(state: account.State) []const RowKind {
     return switch (state) {
-        .signed_out, .starting => if (mac) &.{ .choice, .suggest, .files, .browser, .claude, .login, .menu_bar, .sync, .terms, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .terms, .updates, .welcome, .quit, .theme },
-        .waiting, .signed_in => if (mac) &.{ .choice, .suggest, .files, .browser, .claude, .login, .menu_bar, .sync, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .updates, .welcome, .quit, .theme },
+        .signed_out, .starting => if (mac) &.{ .choice, .suggest, .files, .folders, .browser, .claude, .login, .menu_bar, .sync, .terms, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .terms, .updates, .welcome, .quit, .theme },
+        .waiting, .signed_in => if (mac) &.{ .choice, .suggest, .files, .folders, .browser, .claude, .login, .menu_bar, .sync, .updates, .welcome, .quit, .theme } else &.{ .choice, .suggest, .claude, .login, .sync, .updates, .welcome, .quit, .theme },
     };
 }
 

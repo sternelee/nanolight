@@ -1,7 +1,12 @@
-//! Optional Mac file search. Spotlight owns the index; only paths and names
-//! are read here. Explicit paths use a parent directory listing instead.
+//! File search by name, on the index the system already keeps: Spotlight's,
+//! read through `mdfind` (the Mac's only engine here so far; docs/file-search.md
+//! weighs Everything's USN index for Windows and plocate for Linux). Only
+//! paths and names are read, and only inside the folders chosen in the
+//! welcome or Settings (files_scope.zig). Explicit paths use a parent
+//! directory listing instead.
 const std = @import("std");
 const search = @import("search.zig");
+const scope = @import("files_scope.zig");
 const mac = @import("builtin").os.tag == .macos;
 
 pub const enabled_key = "nanolight.files";
@@ -116,24 +121,20 @@ pub fn isPath(q: []const u8) bool {
     return q.len > 0 and (q[0] == '/' or q[0] == '~');
 }
 
+/// Whether this computer has an index file search may read: Spotlight, for
+/// now. The row and its folders are only offered where it is true.
+pub fn available() bool {
+    return mac;
+}
+
 pub fn eligible(q: []const u8) bool {
-    if (!mac or q.len < 2 or q.len > 256 or isPath(q)) return false;
+    if (!available() or q.len < 2 or q.len > 256 or isPath(q)) return false;
     for (q) |c| if (c < 0x20 or c == 0x7f) return false;
     return true;
 }
 
-pub fn home() []const u8 {
-    if (!mac) return "";
-    return if (std.c.getenv("HOME")) |p| std.mem.span(p) else "";
-}
-
-pub fn expand(buf: []u8, path: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, path, "~")) return path;
-    if (path.len > 1 and path[1] != '/') return null;
-    const h = home();
-    if (h.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}{s}", .{ h, path[1..] }) catch null;
-}
+pub const home = scope.home;
+pub const expand = scope.expand;
 
 pub fn parent(buf: []u8, path: []const u8) []const u8 {
     const p = std.fs.path.dirname(path) orelse "/";
@@ -145,7 +146,7 @@ pub fn parent(buf: []u8, path: []const u8) []const u8 {
 /// Existing paths lead; partial paths list a handful of matching siblings.
 pub fn complete(io: std.Io, query: []const u8, out: *List) void {
     out.deinit();
-    if (!mac or !isPath(query)) return;
+    if (!available() or !isPath(query)) return;
     var expanded: [max_path]u8 = undefined;
     const path = expand(&expanded, query) orelse return;
     const clean = if (path.len > 1) std.mem.trimEnd(u8, path, "/") else path;
@@ -244,15 +245,18 @@ pub fn find(io: std.Io, query: []const u8, locations: []const u8, extra: []const
     const a = arena.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(a, "/usr/bin/mdfind") catch return false;
-    var lines = std.mem.tokenizeScalar(u8, if (std.mem.trim(u8, locations, " \r\n\t").len == 0) home() else locations, '\n');
+    var lines = std.mem.tokenizeScalar(u8, std.mem.trim(u8, locations, " \r\n\t"), '\n');
+    var scoped: usize = 0;
     while (lines.next()) |line| {
         var buf: [max_path]u8 = undefined;
         const path = expand(&buf, std.mem.trim(u8, line, " \r\t")) orelse continue;
         if (path.len == 0 or path[0] != '/') continue;
         const owned = a.dupe(u8, path) catch return false;
         argv.appendSlice(a, &.{ "-onlyin", owned }) catch return false;
+        scoped += 1;
     }
-    if (argv.items.len == 1) return false;
+    // Nothing chosen to look in searches nothing: never the whole disk.
+    if (scoped == 0) return false;
     const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 2000;
     argv.append(a, "") catch return false;
     var ok = false;

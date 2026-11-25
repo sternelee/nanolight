@@ -55,6 +55,10 @@ const sync_at_key = "nanolight.sync.at";
 
 /// The app around the panel: its window, shown and hidden (panel_mac.zig,
 /// panel_pc.zig), its key, its menu, its updates and its account.
+pub const WelcomeFiles = struct {
+    on: bool,
+    scope: @import("files_scope.zig").Scope,
+};
 pub const Live = struct {
     app: *nanoui.App,
     s: *Nanolight,
@@ -90,6 +94,9 @@ pub const Live = struct {
     env: ?*const std.process.Environ.Map = null,
     /// The next `hide` is skipped: a command just took the panel.
     keep_open: bool = false,
+    /// File search as it was before a first run's welcome showed it: put
+    /// back when the welcome is left before its file step keeps anything.
+    welcome_files: ?WelcomeFiles = null,
 
     fn host(l: *Live) view.Host {
         const bind = @import("settings_bind.zig");
@@ -375,7 +382,7 @@ pub const Live = struct {
     }
 
     fn hooks(l: *Live) @import("onboard.zig").Hooks {
-        return .{ .ctx = l, .apply = apply, .fix = fix, .login = login, .done = done };
+        return .{ .ctx = l, .apply = apply, .fix = fix, .login = login, .files = filesSet, .folders = foldersPick, .done = done };
     }
 
     fn useKey(l: *Live, choice: shortcut.Choice) void {
@@ -431,6 +438,16 @@ pub const Live = struct {
         return @import("login.zig").login(set);
     }
 
+    /// File search, as the welcome's step and Settings leave it: kept.
+    pub fn filesSet(ctx: *anyopaque, on: bool, locations: []const u8) void {
+        @import("files_live.zig").set(ctx, on, locations);
+    }
+
+    /// The system's folder picker, adding what is chosen to the scope.
+    pub fn foldersPick(ctx: *anyopaque, scope: *@import("files_scope.zig").Scope) void {
+        @import("files_live.zig").choose(ctx, scope);
+    }
+
     /// `nanolight --toggle`, or a newer copy starting (single.zig).
     fn command(ctx: *anyopaque, cmd: single.Command) void {
         const l: *Live = @ptrCast(@alignCast(ctx));
@@ -442,6 +459,18 @@ pub const Live = struct {
 
     fn done(ctx: *anyopaque) void {
         const l: *Live = @ptrCast(@alignCast(ctx));
+        // A welcome left before its file step searched nothing: file search
+        // goes back to what it was, rather than staying on for this run.
+        if (l.welcome_files) |prev| {
+            l.welcome_files = null;
+            if (!l.o.files_saved) {
+                l.s.files_on = prev.on;
+                l.s.files_scope = prev.scope;
+                l.s.built = 1;
+                l.s.rebuild();
+                if (l.window) |w| w.redraw();
+            }
+        }
         shortcut.setOnboarded(l.kv);
     }
 
@@ -610,13 +639,20 @@ pub fn main(init: std.process.Init) !void {
     rc.rescan(&live);
     // The newest launch is the one that stays; it hears `--toggle` (single.zig).
     if (single.claim(.{ .ctx = &live, .func = Live.command }) > 0) std.log.info("nanolight: asked an older copy to quit", .{});
-    panel.setup(app, live.window.?, &s, if (o.active) o.height() else s.height());
+    panel.setup(app, live.window.?, &s, if (o.active) o.height(&s) else s.height());
     live.useKey(live.choice);
     live.through = .{ .window = live.window, .height = &s.last_h };
     live.preview.watch(.{ .ctx = &live, .func = Live.pageKey });
     o.hooks = live.hooks();
-    // The first run: the welcome, in the panel.
-    if (!shortcut.onboarded(kv)) o.start(live.choice);
+    // The first run: the welcome, in the panel, with file search on and the
+    // folders it would search already shown (its step keeps them, or turns
+    // it off; skipping the welcome leaves it off).
+    if (!shortcut.onboarded(kv)) {
+        live.welcome_files = .{ .on = s.files_on, .scope = s.files_scope };
+        s.files_on = @import("files.zig").available();
+        s.files_scope = @import("files_scope.zig").Scope.withDefaults();
+        o.start(live.choice);
+    }
     if (mac) live.tray = try app.newTray(.{ .symbol = s.theme.glyph(), .tooltip = "Nanolight" });
     // The menu bar icon, unless Settings took it away.
     if (kv.get(init.gpa, menu_bar_key) catch null) |v| {

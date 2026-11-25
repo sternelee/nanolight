@@ -103,8 +103,57 @@ test "Settings hides the menu bar icon and sends searches out (issues #8, #10)" 
     try std.testing.expect(prefs.menu_bar_on and !s.searches_out and !prefs.searches_out.?);
     // The rows fit: the last one is inside Settings, Settings in the window.
     const quit = t.findText("Quit Nanolight").?;
-    try std.testing.expect(quit.y + quit.h <= settings_view.height);
-    try std.testing.expect(settings_view.height <= view.max_height);
+    try std.testing.expect(quit.y + quit.h <= s.settings_ui.height(&s.files_scope));
+    try std.testing.expect(s.settings_ui.height(&s.files_scope) <= view.max_height);
+}
+
+test "Settings' folders page holds its chips, and comes back" {
+    if (!mac) return error.SkipZigTest;
+    const scope = @import("files_scope.zig");
+    const chips = @import("files_scope_view.zig");
+    const settings = @import("settings_view.zig");
+    const gpa = std.testing.allocator;
+    var ix: Index = .init(gpa);
+    defer ix.deinit();
+    var prefs: tests.Prefs = .{ .files_on = true };
+    prefs.init();
+    var s: view.Nanolight = .{ .index = &ix, .files_on = true };
+    defer s.query.deinit();
+    s.host = prefs.host();
+    s.openSettings();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&s, view.Nanolight.view), .{ .width = view.width, .height = view.max_height, .dark = true });
+    defer t.deinit();
+    t.settle(1);
+    // The row under the switch says how many, and opens a page of its own.
+    try std.testing.expect(t.hasText("Search Files In"));
+    try std.testing.expect(t.hasText("None yet"));
+    try t.clickText("Search Files In");
+    t.settle(1);
+    try std.testing.expectEqual(settings.Page.folders, s.settings_ui.page);
+    try std.testing.expect(t.containsText("With no folder, a search finds no files"));
+    // As many as a scope takes: the page is as tall as they need, and every
+    // chip and the picker stay inside it.
+    var path: [64]u8 = undefined;
+    for (0..scope.max_folders) |i| _ = s.files_scope.add(try std.fmt.bufPrint(&path, "/opt/folder{d}", .{i}));
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 3), chips.rows(&s.files_scope));
+    const h = s.settings_ui.height(&s.files_scope);
+    try std.testing.expect(h <= view.max_height);
+    for ([_][]const u8{ "folder0", "folder7", chips.add_label }) |words| {
+        const r = t.findText(words) orelse return error.MissingChip;
+        try std.testing.expect(r.y + r.h <= h);
+    }
+    // Return opens the picker; what it chose is kept, at once.
+    try std.testing.expect(t.shortcut(.{ .key = ui.Shortcut.enter }));
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 1), prefs.pickers);
+    // Esc goes back to the rows, and Settings still shows the count.
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    t.settle(1);
+    try std.testing.expectEqual(settings.Page.main, s.settings_ui.page);
+    try std.testing.expect(s.settings_ui.open);
+    try std.testing.expect(t.containsText("folders"));
 }
 
 test "Settings' header picks the panel's theme, and keeps it" {
@@ -351,8 +400,8 @@ test "Ask Claude is off until Settings turns it on, and stays as it was left" {
     t.settle(1);
     // The switch and everything under it fit Settings, on every platform.
     const quit = t.findText("Quit Nanolight").?;
-    try std.testing.expect(quit.y + quit.h <= settings_view.height);
-    try std.testing.expect(settings_view.height <= view.max_height);
+    try std.testing.expect(quit.y + quit.h <= s.settings_ui.height(&s.files_scope));
+    try std.testing.expect(s.settings_ui.height(&s.files_scope) <= view.max_height);
     try std.testing.expect(s.claude_on and settings_view.loadClaude(mem.store(), gpa));
     _ = t.shortcut(.{ .key = ui.Shortcut.escape });
     t.settle(1);

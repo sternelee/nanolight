@@ -108,10 +108,11 @@ fn measure(ix: *Index, query: []const u8) f64 {
     var r: results.Results = .{};
     var sug: [results.max_apps]u32 = undefined;
     const ns = ix.suggestions(&sug);
+    const none: @import("files.zig").List = .{};
     const runs = 2000;
     const t0 = CACurrentMediaTime();
     for (0..runs) |_| {
-        r.build(query, ix, sug[0..ns], &.{});
+        r.build(query, ix, sug[0..ns], &.{}, &none);
         std.mem.doNotOptimizeAway(&r);
     }
     return (CACurrentMediaTime() - t0) / runs * 1e6;
@@ -130,9 +131,9 @@ fn cues(io: std.Io) !void {
     try o.flush();
 }
 
-/// The welcome's three steps as this Mac would show them (its shortcuts
-/// and running launchers), `<prefix>-1.png` to `-3.png`; the last also
-/// light, `-3-light.png`.
+/// The welcome's four steps as this Mac would show them (its shortcuts
+/// and running launchers), `<prefix>-1.png` to `-4.png`; the last also
+/// light, `-4-light.png`.
 fn onboardStills(t: *ui.Tester, d: *Stage, s: *view.Nanolight, prefix: []const u8) !void {
     const onboard = @import("onboard.zig");
     const shortcut = @import("shortcut.zig");
@@ -141,6 +142,8 @@ fn onboardStills(t: *ui.Tester, d: *Stage, s: *view.Nanolight, prefix: []const u
     o.system = shortcut.systemKeys(&o.system_buf);
     o.others = shortcut.runningLaunchers();
     s.onboard = &o;
+    s.files_on = @import("files.zig").available();
+    s.files_scope = @import("files_scope.zig").Scope.withDefaults();
     d.intro = false;
     d.shown = true;
     s.reveal();
@@ -153,12 +156,15 @@ fn onboardStills(t: *ui.Tester, d: *Stage, s: *view.Nanolight, prefix: []const u
     t.settle(2);
     try t.screenshot(try std.fmt.bufPrint(&buf, "{s}-2.png", .{prefix}));
     t.ctx.input.cmd = false;
-    o.step = .done;
+    o.step = .files;
     t.settle(2);
     try t.screenshot(try std.fmt.bufPrint(&buf, "{s}-3.png", .{prefix}));
+    o.step = .done;
+    t.settle(2);
+    try t.screenshot(try std.fmt.bufPrint(&buf, "{s}-4.png", .{prefix}));
     t.theme = ui.Theme.light;
     t.settle(2);
-    try t.screenshot(try std.fmt.bufPrint(&buf, "{s}-3-light.png", .{prefix}));
+    try t.screenshot(try std.fmt.bufPrint(&buf, "{s}-4-light.png", .{prefix}));
 }
 
 pub fn main(init: std.process.Init) !void {

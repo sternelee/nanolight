@@ -79,7 +79,7 @@ const Run = struct {
                 s.openSettings();
                 t.frame();
                 // At its height at once, with no slide of its own.
-                try std.testing.expectEqual(@import("settings_view.zig").height, s.last_h);
+                try std.testing.expectEqual(s.settings_ui.height(&s.files_scope), s.last_h);
                 try expect(!t.ctx.animating);
                 s.settings_ui.hide();
                 // The field's focus eases back: frames, but the same pixels.

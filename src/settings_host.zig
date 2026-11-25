@@ -4,6 +4,7 @@
 //! draw Settings with defaults and call nothing.
 const shortcut = @import("shortcut.zig");
 const account = @import("account.zig");
+const scope = @import("files_scope.zig");
 const Theme = @import("palette.zig").Theme;
 
 pub const SettingsHost = struct {
@@ -17,6 +18,10 @@ pub const SettingsHost = struct {
     login: *const fn (ctx: *anyopaque, set: ?bool) bool,
     /// Google's suggestions turned on or off in Settings.
     suggest: *const fn (ctx: *anyopaque, on: bool) void,
+    /// File search turned on or off, with the folders it may use: kept.
+    files: *const fn (ctx: *anyopaque, on: bool, locations: []const u8) void,
+    /// The system's folder picker, adding what is chosen to the scope.
+    folders: *const fn (ctx: *anyopaque, paths: *scope.Scope) void,
     /// Return sends Google searches to the browser (on) or the panel.
     searches_out: *const fn (ctx: *anyopaque, on: bool) void,
     /// The panel's tint, chosen in Settings: kept for the next launch.

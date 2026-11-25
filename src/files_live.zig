@@ -1,14 +1,16 @@
 //! File lookups run off the main thread; answers move their icons to the view.
+//! The folders they may use are the ones the welcome and Settings chose
+//! (files_scope.zig), kept here and handed to the worker with each ask.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const files = @import("files.zig");
+const scope = @import("files_scope.zig");
 const suggest = @import("suggest.zig");
 const Live = @import("main.zig").Live;
-const mac = @import("builtin").os.tag == .macos;
 
 /// File lookups share the suggestions' pause and keep at most one worker.
 pub fn askFiles(ctx: *anyopaque, q: []const u8) void {
-    if (!mac or q.len >= files.max_path) return;
+    if (!files.available() or q.len >= files.max_path) return;
     const l: *Live = @ptrCast(@alignCast(ctx));
     @memcpy(l.files.query[0..q.len], q);
     l.files.len = q.len;
@@ -24,13 +26,14 @@ pub fn askFiles(ctx: *anyopaque, q: []const u8) void {
 }
 
 fn sendFiles(l: *Live) void {
-    if (!mac or l.files.busy or l.files.waiting > 0 or l.files.sent == l.files.epoch or !l.s.files_on) return;
+    if (!files.available() or l.files.busy or l.files.waiting > 0 or l.files.sent == l.files.epoch or !l.s.files_on) return;
     const q = l.files.query[0..l.files.len];
     if (!std.mem.eql(u8, q, std.mem.trim(u8, l.s.query.text(), " \t\r\n"))) return;
     const a = l.app.gpa.create(FileAsk) catch return;
     a.* = .{ .live = l, .len = q.len, .epoch = l.files.epoch, .found = .{ .allocator = l.app.gpa } };
     @memcpy(a.text[0..q.len], q);
-    a.locations = l.kv.get(l.app.gpa, files.locations_key) catch null;
+    // The folders as they are now: a change while a lookup runs asks again.
+    a.locations = l.app.gpa.dupe(u8, l.s.files_scope.text()) catch null;
     a.exclusions = l.kv.get(l.app.gpa, files.exclusions_key) catch null;
     l.files.busy = true;
     l.files.sent = l.files.epoch;
@@ -94,9 +97,50 @@ pub const State = struct {
 };
 
 pub fn load(l: *Live) void {
-    // File search is local to this Mac and off unless explicitly enabled.
-    if (mac) if (l.kv.get(l.app.gpa, files.enabled_key) catch null) |v| {
-        defer l.app.gpa.free(v);
+    // File search is local to this computer and off unless turned on; the
+    // folders chosen live beside the switch (files_scope.zig).
+    if (!files.available()) return;
+    const gpa = l.app.gpa;
+    // The folders kept, or the ones a fresh install starts with; an empty
+    // scope stays empty (a picked set of none searches nothing).
+    if (l.kv.get(gpa, files.locations_key) catch null) |v| {
+        defer gpa.free(v);
+        l.s.files_scope = scope.Scope.fromText(v);
+    } else l.s.files_scope = scope.Scope.withDefaults();
+    if (l.kv.get(gpa, files.enabled_key) catch null) |v| {
+        defer gpa.free(v);
         l.s.files_on = std.mem.eql(u8, v, "1");
-    };
+    }
+}
+
+/// What Settings and the welcome keep: on or off, and the folders it may use.
+/// The panel lists files again now (or stops listing them).
+pub fn set(ctx: *anyopaque, on: bool, locations: []const u8) void {
+    const l: *Live = @ptrCast(@alignCast(ctx));
+    if (!files.available()) return;
+    l.s.files_on = on;
+    l.s.files_scope = scope.Scope.fromText(locations);
+    l.kv.set(files.enabled_key, if (on) "1" else "0") catch {};
+    l.kv.set(files.locations_key, l.s.files_scope.text()) catch {};
+    l.s.built = 1;
+    l.s.rebuild();
+    if (l.window) |w| w.redraw();
+}
+
+/// The system's folder picker, over the panel: what is chosen is added to
+/// `chosen`, and kept with the rest of the scope.
+pub fn choose(ctx: *anyopaque, chosen: *scope.Scope) void {
+    const l: *Live = @ptrCast(@alignCast(ctx));
+    if (!files.available()) return;
+    const picked = (nanoui.dialog.open(l.app.gpa, .{
+        .title = "Search Files In",
+        .message = "Nanolight searches these folders, and nothing else.",
+        .button = "Search Here",
+        .files = false,
+        .directories = true,
+        .multiple = true,
+    }) catch return) orelse return;
+    defer nanoui.dialog.freePaths(l.app.gpa, picked);
+    for (picked) |path| _ = chosen.add(path);
+    set(l, l.s.files_on, chosen.text());
 }

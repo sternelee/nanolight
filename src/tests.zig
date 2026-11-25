@@ -26,6 +26,8 @@ test {
     _ = @import("tests_ext.zig");
     _ = @import("tests_prefs.zig");
     _ = @import("tests_files.zig");
+    _ = @import("files_scope.zig");
+    _ = @import("files_scope_view.zig");
     _ = @import("row_window.zig");
     _ = @import("answers.zig");
     _ = @import("tests_panel.zig");
@@ -292,18 +294,34 @@ const shortcut = @import("shortcut.zig");
 const Steps = struct {
     applied: ?shortcut.Choice = null,
     done: bool = false,
+    /// What the files step kept: on or off, and the folders' text.
+    files: ?bool = null,
+    kept: [128]u8 = undefined,
+    kept_len: usize = 0,
+    pickers: u8 = 0,
     fn apply(ctx: *anyopaque, c: shortcut.Choice) void {
         const p: *Steps = @ptrCast(@alignCast(ctx));
         p.applied = c;
     }
     fn fix(_: *anyopaque, _: shortcut.Clash) void {}
+    fn filesSet(ctx: *anyopaque, on: bool, locations: []const u8) void {
+        const p: *Steps = @ptrCast(@alignCast(ctx));
+        p.files = on;
+        p.kept_len = @min(locations.len, p.kept.len);
+        @memcpy(p.kept[0..p.kept_len], locations[0..p.kept_len]);
+    }
+    fn pick(ctx: *anyopaque, scope: *@import("files_scope.zig").Scope) void {
+        const p: *Steps = @ptrCast(@alignCast(ctx));
+        p.pickers += 1;
+        _ = scope.add("/opt/picked");
+    }
     fn finished(ctx: *anyopaque) void {
         const p: *Steps = @ptrCast(@alignCast(ctx));
         p.done = true;
     }
 };
 
-test "the welcome: a key, pressed for real, then a first search" {
+test "the welcome: a key, pressed for real, then file search, then a first search" {
     // Its keys and clashes are the Mac's (macOS's own shortcuts).
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -317,8 +335,8 @@ test "the welcome: a key, pressed for real, then a first search" {
     const sys = [_]shortcut.SystemKey{.{ .id = 64, .enabled = true, .key = 49, .mods = 1 << 20 }};
     o.system = &sys;
     var steps: Steps = .{};
-    o.hooks = .{ .ctx = &steps, .apply = Steps.apply, .fix = Steps.fix, .done = Steps.finished };
-    var s: view.Nanolight = .{ .index = &ix, .onboard = &o };
+    o.hooks = .{ .ctx = &steps, .apply = Steps.apply, .fix = Steps.fix, .files = Steps.filesSet, .folders = Steps.pick, .done = Steps.finished };
+    var s: view.Nanolight = .{ .index = &ix, .onboard = &o, .files_on = true, .files_scope = @import("files_scope.zig").Scope.withDefaults() };
     defer s.query.deinit();
     var t: ui.Tester = undefined;
     try t.init(gpa, .init(&s, view.Nanolight.view), .{ .width = view.width, .height = 480, .dark = true });
@@ -341,8 +359,35 @@ test "the welcome: a key, pressed for real, then a first search" {
     o.pressed(true);
     o.pressed(false);
     t.settle(2);
+    // File search: on, in the folders shown, until turned off here.
+    try std.testing.expectEqual(onboard.Step.files, o.step);
+    try std.testing.expect(t.hasText("Find files as you type"));
+    try std.testing.expect(t.hasText("Search files as you type"));
+    try std.testing.expect(t.hasText("3 folders"));
+    try std.testing.expect(t.containsText("3 of 4"));
+    for ([_][]const u8{ "Desktop", "Documents", "Downloads" }) |folder| try std.testing.expect(t.hasText(folder));
+    // Space turns it off, and that is kept as it changes.
+    try std.testing.expect(t.shortcut(.{ .key = ' ' }));
+    t.settle(1);
+    try std.testing.expect(!s.files_on);
+    try std.testing.expectEqual(false, steps.files.?);
+    // The picker's chip opens the system's picker; the folder it took is a
+    // chip too, and kept with the rest.
+    try t.clickText(@import("files_scope_view.zig").add_label);
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 1), steps.pickers);
+    try std.testing.expect(t.hasText("picked"));
+    try std.testing.expectEqual(@as(usize, 4), s.files_scope.count());
+    try std.testing.expect(std.mem.indexOf(u8, steps.kept[0..steps.kept_len], "/opt/picked") != null);
+    // ⌘O opens the same picker without a mouse: the step is not click-only.
+    try std.testing.expect(t.shortcut(.{ .key = 'o', .cmd = true }));
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 2), steps.pickers);
+    // Return moves on: the last step, and ⌘2's example run in the launcher.
+    t.key(.enter);
+    t.settle(2);
+    try std.testing.expectEqual(onboard.Step.done, o.step);
     try std.testing.expect(t.hasText("You're set."));
-    // ⌘2: the math example, run in the launcher.
     try std.testing.expect(t.shortcut(.{ .key = '2', .cmd = true }));
     t.settle(1);
     try std.testing.expect(steps.done and !o.active);
@@ -355,6 +400,22 @@ test "the welcome: a key, pressed for real, then a first search" {
     _ = t.shortcut(.{ .key = ui.Shortcut.escape });
     try std.testing.expect(steps.done and !o.active);
     try std.testing.expectEqual(shortcut.Choice.ctrl_space, steps.applied.?);
+    // Skipped: file search was never reached, so it is not kept.
+    try std.testing.expectEqual(@as(?bool, null), steps.files);
+    try std.testing.expect(!o.files_saved);
+
+    // Reaching the step and pressing Return keeps what it shows, even when
+    // nothing on it was touched.
+    s.files_on = true;
+    s.files_scope = @import("files_scope.zig").Scope.withDefaults();
+    steps = .{};
+    o.start(.opt_space);
+    o.step = .files;
+    t.settle(1);
+    t.key(.enter);
+    t.settle(2);
+    try std.testing.expectEqual(@as(?bool, true), steps.files);
+    try std.testing.expectEqualStrings("~/Desktop\n~/Documents\n~/Downloads", steps.kept[0..steps.kept_len]);
 }
 
 const SettingsHost = @import("settings_host.zig").SettingsHost;
@@ -370,6 +431,12 @@ pub const Prefs = struct {
     searches_out: ?bool = null,
     theme: ?@import("palette.zig").Theme = null,
     menu_bar_on: bool = true,
+    /// File search as Settings left it, and how often its picker opened.
+    files_on: bool = false,
+    files_kept: [64]u8 = undefined,
+    files_len: usize = 0,
+    files_sets: u8 = 0,
+    pickers: u8 = 0,
     box: SettingsHost = undefined,
 
     pub fn init(p: *Prefs) void {
@@ -380,6 +447,8 @@ pub const Prefs = struct {
             .record = record,
             .login = login,
             .suggest = suggestSet,
+            .files = filesSet,
+            .folders = pick,
             .searches_out = searchesOut,
             .theme = themeSet,
             .menu_bar = menuBar,
@@ -423,6 +492,17 @@ pub const Prefs = struct {
     }
     fn suggestSet(ctx: *anyopaque, _: bool) void {
         @as(*Prefs, @ptrCast(@alignCast(ctx))).suggest_sets += 1;
+    }
+    fn filesSet(ctx: *anyopaque, on: bool, locations: []const u8) void {
+        const p: *Prefs = @ptrCast(@alignCast(ctx));
+        p.files_on = on;
+        p.files_sets += 1;
+        p.files_len = @min(locations.len, p.files_kept.len);
+        @memcpy(p.files_kept[0..p.files_len], locations[0..p.files_len]);
+    }
+    fn pick(ctx: *anyopaque, scope: *@import("files_scope.zig").Scope) void {
+        @as(*Prefs, @ptrCast(@alignCast(ctx))).pickers += 1;
+        _ = scope.add("/opt/picked");
     }
     fn searchesOut(ctx: *anyopaque, on: bool) void {
         @as(*Prefs, @ptrCast(@alignCast(ctx))).searches_out = on;
@@ -623,10 +703,58 @@ test "the panel never outgrows its window, which is never resized" {
     s.answered("a", &four);
     try std.testing.expectEqual(view.rows_height, s.height());
     var o: onboard.Onboard = .{};
-    for ([_]onboard.Step{ .key, .try_it, .done }) |step| {
+    // Every step, and the files one with as many folders as it takes, fits
+    // the window the panel is drawn in.
+    for ([_]onboard.Step{ .key, .try_it, .files, .done }) |step| {
         o.step = step;
-        try std.testing.expect(o.height() <= view.max_height);
+        s.files_scope = @import("files_scope.zig").Scope.withDefaults();
+        try std.testing.expect(o.height(&s) <= view.max_height);
     }
+    var many = @import("files_scope.zig").Scope{};
+    var path: [32]u8 = undefined;
+    for (0..@import("files_scope.zig").max_folders) |i| _ = many.add(try std.fmt.bufPrint(&path, "/opt/folder{d}", .{i}));
+    s.files_scope = many;
+    o.step = .files;
+    try std.testing.expect(o.height(&s) <= view.max_height);
+}
+
+test "the welcome's file step grows with its folders, and never clips them" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const scope = @import("files_scope.zig");
+    const chips = @import("files_scope_view.zig");
+    const gpa = std.testing.allocator;
+    var ix: Index = .init(gpa);
+    defer ix.deinit();
+    var o: onboard.Onboard = .{};
+    o.start(.cmd_space);
+    var s: view.Nanolight = .{ .index = &ix, .onboard = &o, .files_on = true };
+    defer s.query.deinit();
+    defer s.found.deinit();
+    // As many folders as a scope takes: three rows of chips.
+    var many: scope.Scope = .{};
+    var path: [64]u8 = undefined;
+    for (0..scope.max_folders) |i| _ = many.add(try std.fmt.bufPrint(&path, "/opt/folder{d}", .{i}));
+    s.files_scope = many;
+    o.step = .files;
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&s, view.Nanolight.view), .{ .width = view.width, .height = view.max_height, .dark = true });
+    defer t.deinit();
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 3), chips.rows(&s.files_scope));
+    const h = o.height(&s);
+    try std.testing.expect(h <= view.max_height);
+    // The last folder and the picker's chip are on the last row, inside the
+    // panel: nothing the step offers is drawn outside it.
+    for ([_][]const u8{ "folder0", "folder7", chips.add_label }) |words| {
+        const r = t.findText(words) orelse return error.MissingChip;
+        try std.testing.expect(r.y + r.h <= h);
+    }
+    try std.testing.expect(t.containsText("3 of 4"));
+    // No folders at all is said, not silently nothing.
+    s.files_scope.clear();
+    t.settle(1);
+    try std.testing.expect(t.containsText("Nothing is searched until you add one."));
+    try std.testing.expect(o.height(&s) < view.max_height);
 }
 
 test "on a PC the panel's keys are Ctrl's, and Settings says so" {
