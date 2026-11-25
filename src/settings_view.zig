@@ -268,6 +268,8 @@ pub const Settings = struct {
 
     /// The folders page: what file search looks in, a chip each (its × takes
     /// it out), the picker on Return or its own chip, and Back on Esc.
+    /// Return is handled once, in `inPanel`: a real Return is `input.key`,
+    /// never a shortcut (surface_events keeps 0x0d out of that list).
     fn foldersPage(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
         const S = ui.Shortcut;
         const h = s.hooks(n);
@@ -275,10 +277,6 @@ pub const Settings = struct {
             s.page = .main;
             n.query.focus();
             return;
-        }
-        if (c.shortcut(.{ .key = S.enter })) {
-            if (h) |host| host.folders(host.ctx, &n.files_scope);
-            c.changed = true;
         }
         ui.key(c, "settings-folders");
         {
@@ -448,9 +446,18 @@ pub const Settings = struct {
     /// Settings in place of the rows, the panel's height following them.
     pub fn inPanel(s: *Settings, c: *ui.Context, n: *panel.Nanolight, p: Palette) void {
         // Return is the field's command, or a key. One event, one act.
+        // The folders page has no rows to activate: its Return opens the
+        // picker, and the main list's selection is left where it was.
+        if (!s.returned(c)) s.took_return = false;
         if (s.returned(c) and !s.took_return) {
             s.took_return = true;
-            s.activateSelected(n);
+            switch (s.page) {
+                .folders => {
+                    if (s.hooks(n)) |host| host.folders(host.ctx, &n.files_scope);
+                    c.changed = true;
+                },
+                .main => s.activateSelected(n),
+            }
         }
         const h = n.follow(s.height(&n.files_scope));
         const box = ui.div(c).column().wFull().h(h).clip();

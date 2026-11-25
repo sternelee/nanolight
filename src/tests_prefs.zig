@@ -144,16 +144,33 @@ test "Settings' folders page holds its chips, and comes back" {
         const r = t.findText(words) orelse return error.MissingChip;
         try std.testing.expect(r.y + r.h <= h);
     }
-    // Return opens the picker; what it chose is kept, at once.
-    try std.testing.expect(t.shortcut(.{ .key = ui.Shortcut.enter }));
+    // Return opens the picker; what it chose is kept, at once. A real
+    // Return is `input.key` (surface_events keeps 0x0d out of `shortcut`),
+    // so this presses the key, not a synthesized combination.
+    const sel_before = s.settings_ui.sel;
+    t.key(.enter);
     t.settle(1);
     try std.testing.expectEqual(@as(u8, 1), prefs.pickers);
+    // It opened the picker and nothing else: the main list's selection is
+    // where it was, and no row was activated behind the page.
+    try std.testing.expectEqual(settings.Page.folders, s.settings_ui.page);
+    try std.testing.expectEqual(sel_before, s.settings_ui.sel);
+    try std.testing.expect(!s.settings_ui.recording);
+    // A second Return opens it again: one press, one picker, every time.
+    t.key(.enter);
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 2), prefs.pickers);
     // Esc goes back to the rows, and Settings still shows the count.
     _ = t.shortcut(.{ .key = ui.Shortcut.escape });
     t.settle(1);
     try std.testing.expectEqual(settings.Page.main, s.settings_ui.page);
     try std.testing.expect(s.settings_ui.open);
     try std.testing.expect(t.containsText("folders"));
+    // Back on the rows, Return activates the selected row again.
+    t.key(.enter);
+    t.settle(1);
+    try std.testing.expectEqual(@as(u8, 2), prefs.pickers);
+    try std.testing.expect(s.settings_ui.recording);
 }
 
 test "Settings' header picks the panel's theme, and keeps it" {
