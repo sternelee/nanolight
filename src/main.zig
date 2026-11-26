@@ -474,7 +474,7 @@ pub const Live = struct {
     pub fn indexState(ctx: *anyopaque) @import("settings_host.zig").IndexState {
         const l: *Live = @ptrCast(@alignCast(ctx));
         const p = l.meaning_indexing;
-        return .{ .running = p.running, .files_seen = p.files_seen, .files_indexed = p.files_indexed, .problem = p.problem };
+        return .{ .running = p.running, .files_seen = p.files_seen, .files_indexed = p.files_indexed, .files_reused = p.files_reused, .problem = p.problem };
     }
 
     /// `nanolight --toggle`, or a newer copy starting (single.zig).

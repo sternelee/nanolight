@@ -15,6 +15,7 @@ const model = @import("embed_model.zig");
 const download = @import("model_download.zig");
 const runtime = @import("embed_runtime.zig");
 const vectors = @import("vector_index.zig");
+const Kind = vectors.Kind;
 const semantic = @import("semantic_live.zig");
 const Live = @import("main.zig").Live;
 
@@ -23,6 +24,8 @@ pub const Progress = struct {
     running: bool = false,
     files_seen: usize = 0,
     files_indexed: usize = 0,
+    /// How many kept their vector from the last build, never re-embedded.
+    files_reused: usize = 0,
     /// Why it stopped, when it did.
     problem: []const u8 = "",
 };
@@ -30,15 +33,20 @@ pub const Progress = struct {
 /// A file's path and the pieces of it that went in.
 const Found = struct {
     path: []const u8,
-    text: []u8,
+    /// Null for a file whose stamp matched the last build: its vector is
+    /// already in `stored`, so the text is never read or embedded again.
+    text: ?[]u8 = null,
     mtime: i64,
     size: u64,
     chunks: [extract.max_chunks][]const u8 = undefined,
     n: usize = 0,
+    /// The float16 vector from the previous index, when unchanged.
+    stored: ?[]const u8 = null,
+    stored_kind: Kind = .text,
 
     fn free(f: *Found, gpa: std.mem.Allocator) void {
         gpa.free(f.path);
-        gpa.free(f.text);
+        if (f.text) |t| gpa.free(t);
     }
 };
 
@@ -69,7 +77,14 @@ pub const Job = struct {
         var it = l.s.files_scope.lines();
         while (it.next()) |line| {
             if (job.dir_count >= scope.max_folders) break;
+            // `expand` returns the line unchanged for an absolute path, so
+            // the bytes must be copied into the job's own buffer: the line
+            // is a slice of the scope, which can change under us.
             const path = scope.expand(&job.dirs[job.dir_count], line) orelse continue;
+            if (path.ptr != &job.dirs[job.dir_count]) {
+                if (path.len > scope.max_path) continue;
+                @memcpy(job.dirs[job.dir_count][0..path.len], path);
+            }
             job.dir_lens[job.dir_count] = @min(path.len, scope.max_path);
             job.dir_count += 1;
         }
@@ -99,7 +114,11 @@ pub const Job = struct {
             if (l.window) |w| w.redraw();
         }
 
-        // 1. Walk the folders, keeping only readable text files.
+        // 1. Walk the folders, keeping only readable text files. A file
+        // whose stamp matches the last build keeps its vector and is not
+        // read or embedded again: only changed and new files cost work.
+        var previous = vectors.Index.loadFor(io, gpa, indexPathOf(), model.fingerprint) catch vectors.Index{ .gpa = gpa };
+        defer previous.deinit();
         var seen: usize = 0;
         for (job.dirs[0..job.dir_count], job.dir_lens[0..job.dir_count]) |dir, dir_len| {
             if (seen >= max_files) break;
@@ -117,11 +136,30 @@ pub const Job = struct {
                 if (files.excluded(full, "")) continue;
                 const st = std.Io.Dir.cwd().statFile(io, full, .{}) catch continue;
                 if (st.size > extract.max_bytes or st.size == 0) continue;
+                const stamp: vectors.Stamp = .{
+                    .mtime = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s)),
+                    .size = st.size,
+                };
+                // Unchanged since the last build: reuse its vector as is.
+                if (previous.recordFor(full, stamp)) |i| {
+                    const f: Found = .{
+                        .path = gpa.dupe(u8, full) catch continue,
+                        .mtime = stamp.mtime,
+                        .size = stamp.size,
+                        .stored = previous.vector(i),
+                        .stored_kind = previous.kind(i),
+                    };
+                    job.found.append(gpa, f) catch {
+                        gpa.free(f.path);
+                        break;
+                    };
+                    continue;
+                }
                 const text = extract.extract(gpa, io, full) catch continue;
                 var f: Found = .{ .path = gpa.dupe(u8, full) catch {
                     gpa.free(text);
                     continue;
-                }, .text = text, .mtime = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_s)), .size = st.size };
+                }, .text = text, .mtime = stamp.mtime, .size = stamp.size };
                 f.n = extract.chunks(text, &f.chunks);
                 if (f.n == 0) {
                     f.free(gpa);
@@ -152,7 +190,15 @@ pub const Job = struct {
         // batch may span files without mixing their records.
         var batch: [batch_size]Piece = undefined;
         var count: usize = 0;
+        var reused: usize = 0;
         for (job.found.items) |*f| {
+            // Unchanged: its vector is already right, so it goes in as is
+            // and never reaches the model.
+            if (f.stored) |stored| {
+                b.addStored(f.path, f.stored_kind, .{ .mtime = f.mtime, .size = f.size }, stored) catch continue;
+                reused += 1;
+                continue;
+            }
             for (f.chunks[0..f.n]) |piece| {
                 var framed_buf: [extract.chunk_chars + 256]u8 = undefined;
                 const framed = model.documentText(&framed_buf, std.fs.path.basename(f.path), piece) orelse continue;
@@ -178,10 +224,18 @@ pub const Job = struct {
         l.meaning.index = vectors.Index.loadFor(io, gpa, path, model.fingerprint) catch .{ .gpa = gpa };
         l.meaning.index_loaded = true;
         l.meaning_indexing.files_indexed = job.found.items.len;
+        l.meaning_indexing.files_reused = reused;
     }
 };
 
 var job_path_buf: [scope.max_path + 256]u8 = undefined;
+
+/// The index's path, as `semantic_live` names it. Kept here so the builder
+/// can read the previous index before writing a new one.
+var index_path_buf: [model.max_path]u8 = undefined;
+fn indexPathOf() []const u8 {
+    return semantic.indexPath(&index_path_buf);
+}
 
 pub const max_files = 20_000;
 pub const batch_size = 16;

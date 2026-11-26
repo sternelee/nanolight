@@ -176,16 +176,26 @@ code evidence, not style notes. Ordered by severity.
   everything" goal.
 - [ ] **Scanned PDFs / OCR**: pages with no text layer are skipped today.
   Rendering plus OCR (Vision on the Mac) would cover them.
-- [ ] **Incremental indexing**: a build rewrites the whole index. Changed
-  files are re-read on the next full build; there is no watcher or per-file
-  update yet.
+- [x] **Incremental indexing** (`index_builder.zig`, `vector_index.zig`).
+  A build reads the previous index first and compares each file's stamp
+  (mtime and size). An unchanged file keeps its stored float16 vector via
+  `Builder.addStored` -- no text extraction, no model call. Only new and
+  changed files are embedded. `Index.recordFor` returns the record only
+  when the stamp matches exactly. Measured on a 10-file folder: first
+  build reused 0, second reused 9; after editing one file, reused 8.
+  Still no filesystem watcher: a rebuild is asked for by hand.
+- [x] **A real bug found while testing this**: `Job.start` copied the
+  scope's folder lines into the job's buffer only when `expand` rewrote
+  them. For an absolute path `expand` returns the line unchanged, so the
+  job's buffer stayed uninitialised and every build walked garbage. It
+  went unnoticed because the earlier probes used `~` paths.
 - [x] **Commit**: the work is committed on `embedding` in six commits
   (`e1624d0` through `bd1b817`), plus the two earlier file-search fixes.
 - [ ] **Push**: `origin/embedding` does not exist yet.
 
 ## Verification so far
 
-- `zig build test-bin`: 144 passed, 1 skipped, 0 failed.
+- `zig build test-bin`: 146 passed, 1 skipped, 0 failed.
 - `zig build`, `zig build film`, Windows and Linux cross-compiles: all exit 0.
 - End-to-end probes against a real model: download + SHA-256, server start,
   embed, index, query. A dog query ranked a dog file 0.776 and a budget file

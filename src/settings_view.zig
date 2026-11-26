@@ -363,7 +363,13 @@ pub const Settings = struct {
             } else if (ix.problem.len > 0) {
                 ui.text(c, ix.problem, .{ .size = 12, .color = p.sub.alpha(0.9) });
             } else if (ix.files_indexed > 0) {
-                ui.textf(c, .{ .size = 12, .color = p.sub }, "Indexed {d} files.", .{ix.files_indexed});
+                // Say how much was reused: a rebuild after one edit should
+                // not look like it re-read everything.
+                if (ix.files_reused > 0) {
+                    ui.textf(c, .{ .size = 12, .color = p.sub }, "Indexed {d} files ({d} unchanged).", .{ ix.files_indexed, ix.files_reused });
+                } else {
+                    ui.textf(c, .{ .size = 12, .color = p.sub }, "Indexed {d} files.", .{ix.files_indexed});
+                }
             }
             const build = ui.div(c).row().wFull().h(32).px(12).itemsCenter().rounded(10).control().bg(p.tile).hover(p.sel);
             defer build.end();

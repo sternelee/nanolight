@@ -184,6 +184,18 @@ pub const Index = struct {
         return n;
     }
 
+    /// The record for `path` when it was read at exactly `stamp`, or null.
+    /// A file whose stamp moved is read again rather than trusted.
+    pub fn recordFor(ix: *const Index, path: []const u8, stamp_v: Stamp) ?usize {
+        for (0..ix.count) |i| {
+            if (!std.mem.eql(u8, ix.pathAt(i), path)) continue;
+            const s = ix.stamp(i);
+            if (s.mtime == stamp_v.mtime and s.size == stamp_v.size) return i;
+            return null; // the path is there but the file changed
+        }
+        return null;
+    }
+
     /// The cosine of a record against a query vector, for a caller that
     /// wants one file's score rather than a ranking.
     pub fn scoreOf(ix: *const Index, i: usize, query: []const f32) f32 {
@@ -245,6 +257,20 @@ pub const Builder = struct {
             const h: f16 = @floatCast(v);
             try b.appendInt(u16, @bitCast(h));
         }
+        b.count += 1;
+    }
+
+    /// Adds a record whose vector is already stored as float16 bytes, as
+    /// an unchanged file's is: no round trip through f32, so the numbers
+    /// are exactly what the last build wrote.
+    pub fn addStored(b: *Builder, path: []const u8, kind: Kind, stamp_v: Stamp, stored: []const u8) !void {
+        if (path.len > max_path or stored.len != dimension * 2) return error.Truncated;
+        try b.appendInt(u16, @intCast(path.len));
+        try b.buf.append(b.gpa, @intFromEnum(kind));
+        try b.appendInt(i64, stamp_v.mtime);
+        try b.appendInt(u64, stamp_v.size);
+        try b.buf.appendSlice(b.gpa, path);
+        try b.buf.appendSlice(b.gpa, stored);
         b.count += 1;
     }
 
@@ -522,4 +548,64 @@ test "an index from another model or prompt is refused, not scored" {
     var empty = try Index.loadFor(t.io, gpa, "/nonexistent/nanolight/none.idx", @splat('z'));
     defer empty.deinit();
     try t.expectEqual(@as(usize, 0), empty.count);
+}
+
+test "recordFor finds an unchanged file and refuses a changed one" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const file = tmpPath(&tmp, &buf, "stamps.idx");
+    var vec: [dimension]f32 = undefined;
+    @memset(&vec, 0);
+    vec[0] = 1;
+    var b = try Builder.init(gpa, @splat('m'));
+    defer b.deinit();
+    try b.add("/notes/lease.md", .text, .{ .mtime = 1700, .size = 4096 }, &vec);
+    try b.save(t.io, file);
+    var ix = try Index.load(t.io, gpa, file);
+    defer ix.deinit();
+
+    // Same path, same stamp: the record is reused.
+    try t.expectEqual(@as(?usize, 0), ix.recordFor("/notes/lease.md", .{ .mtime = 1700, .size = 4096 }));
+    // Same path, a newer mtime: the file changed, so it must be read again.
+    try t.expectEqual(@as(?usize, null), ix.recordFor("/notes/lease.md", .{ .mtime = 1800, .size = 4096 }));
+    // Same path, a different size: also changed.
+    try t.expectEqual(@as(?usize, null), ix.recordFor("/notes/lease.md", .{ .mtime = 1700, .size = 5000 }));
+    // A path that was never indexed.
+    try t.expectEqual(@as(?usize, null), ix.recordFor("/notes/other.md", .{ .mtime = 1700, .size = 4096 }));
+}
+
+test "addStored moves a vector without rounding it again" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const first = tmpPath(&tmp, &buf, "one.idx");
+    var vec: [dimension]f32 = undefined;
+    @memset(&vec, 0);
+    vec[0] = 0.5;
+    vec[1] = 0.25;
+    var b = try Builder.init(gpa, @splat('m'));
+    defer b.deinit();
+    try b.add("/a.txt", .text, .{ .mtime = 100, .size = 10 }, &vec);
+    try b.save(t.io, first);
+    var ix = try Index.load(t.io, gpa, first);
+    defer ix.deinit();
+
+    // Copy the stored bytes into a new index: the numbers must be identical.
+    var b2 = try Builder.init(gpa, @splat('m'));
+    defer b2.deinit();
+    try b2.addStored(ix.pathAt(0), ix.kind(0), ix.stamp(0), ix.vector(0));
+    var buf2: [256]u8 = undefined;
+    const second = tmpPath(&tmp, &buf2, "two.idx");
+    try b2.save(t.io, second);
+    var ix2 = try Index.load(t.io, gpa, second);
+    defer ix2.deinit();
+    try t.expectEqual(@as(usize, 1), ix2.count);
+    try t.expectEqualSlices(u8, ix.vector(0), ix2.vector(0));
+    try t.expectEqualStrings("/a.txt", ix2.pathAt(0));
+    try t.expectEqual(@as(i64, 100), ix2.stamp(0).mtime);
 }

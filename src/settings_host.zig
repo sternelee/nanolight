@@ -12,6 +12,8 @@ pub const IndexState = struct {
     running: bool = false,
     files_seen: usize = 0,
     files_indexed: usize = 0,
+    /// How many kept their vector from the last build.
+    files_reused: usize = 0,
     problem: []const u8 = "",
 };
 
