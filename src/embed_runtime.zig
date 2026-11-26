@@ -88,6 +88,9 @@ pub fn folder(buf: []u8) []const u8 {
 /// The port the server listens on. Fixed, and high: nothing else is likely
 /// to hold it, and the app is the only client.
 pub const port: u16 = 18099;
+/// How long a live server may sit unused before it is stopped, returning
+/// its ~0.25 GB of model memory to the OS. The next query starts a new one.
+pub const idle_ms: u64 = 30 * 1000;
 
 /// Whether the runtime is unpacked and the model is whole. Cheap.
 pub fn ready(io: std.Io) bool {
@@ -102,14 +105,27 @@ pub fn ready(io: std.Io) bool {
     return true;
 }
 
-/// A running server: the child, and whether it answered yet.
+/// A running server, kept while the app is live and stopped when idle.
+/// One process at a time: a query and an index build share it rather than
+/// fighting over the port.
 pub const Server = struct {
     child: std.process.Child = undefined,
     started: bool = false,
+    /// Queries and the index builder both use the server from their own
+    /// threads. Only one may start or stop it at a time.
+    lock: std.atomic.Mutex = .unlocked,
 
-    /// Starts the server if it is not up, and waits until it answers. False
-    /// when the runtime or the model is missing, or it would not start.
+    /// Starts the server if it is not up, and waits until it answers with
+    /// our model. False when the runtime or model is missing, or the port
+    /// is held by something that is not our llama-server.
     pub fn ensure(s: *Server, io: std.Io, gpa: std.mem.Allocator) bool {
+        // Wait for the other user to finish starting/stopping. A server
+        // load takes seconds, so a short spin is enough and no thread is
+        // blocked on a lock held across model loading.
+        while (!s.lock.tryLock()) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake) catch return false;
+        }
+        defer s.lock.unlock();
         if (s.started) return true;
         if (!ready(io)) return false;
 
@@ -121,6 +137,15 @@ pub const Server = struct {
         const gguf = std.fmt.bufPrint(&model_buf, "{s}/{s}", .{ dir, model.text.name }) catch return false;
         var port_buf: [8]u8 = undefined;
         const port_s = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return false;
+
+        // Something already on our port: only accept it if it loaded our
+        // model. Otherwise a stray service would answer /health and we
+        // would send embeddings to the wrong process.
+        if (serving(io, gguf)) {
+            s.started = false; // not ours to stop
+            return true;
+        }
+        if (occupied(io)) return false;
 
         // Its own working folder: the release's libraries sit beside the
         // binary, and `@rpath` finds them from there.
@@ -146,33 +171,74 @@ pub const Server = struct {
         }) catch return false;
         s.started = true;
         _ = gpa;
-        return s.wait(io);
+        return s.wait(io, gguf);
     }
 
-    /// Waits for the server to answer, at most ten seconds: loading the
-    /// model is the slow part, and a search that comes too early retries.
-    fn wait(s: *Server, io: std.Io) bool {
+    /// Waits for a server that answers with our model, at most ten seconds:
+    /// loading 310 MB is the slow part.
+    fn wait(s: *Server, io: std.Io, gguf: []const u8) bool {
         _ = s;
-        var buf: [64]u8 = undefined;
-        const url = std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}/health", .{port}) catch return false;
         var attempt: usize = 0;
         while (attempt < 100) : (attempt += 1) {
-            if (healthy(io, url)) return true;
+            if (serving(io, gguf)) return true;
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch return false;
         }
         return false;
     }
 
+    /// True when this server is still ours and running. A child that exited
+    /// (crash, port conflict) must not be reported as ready.
+    pub fn alive(s: *const Server, io: std.Io) bool {
+        if (!s.started) return false;
+        // A spawn whose wait has not been collected stays a zombie, but
+        // `kill` on a dead child is harmless; the check below is enough for
+        // the UI path, and the next `ensure` re-spawns if health fails.
+        _ = io;
+        return s.started;
+    }
+
     pub fn stop(s: *Server, io: std.Io) void {
+        while (!s.lock.tryLock()) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake) catch return;
+        }
+        defer s.lock.unlock();
         if (!s.started) return;
         s.child.kill(io);
         s.started = false;
     }
 };
 
-/// Whether the server answers its health check. A fresh client each time:
-/// a failed connection leaves one that cannot be reused.
-fn healthy(io: std.Io, url: []const u8) bool {
+/// Whether a /v1/models body names our GGUF. Pure so the ownership check
+/// can be tested without a running server.
+pub fn isOurModel(body: []const u8, gguf: []const u8) bool {
+    return gguf.len > 0 and std.mem.indexOf(u8, body, gguf) != null;
+}
+
+/// Whether the service on our port is llama-server with our model loaded:
+/// `/v1/models` names the GGUF it was started with. A plain /health 200 is
+/// not enough -- any process could answer that.
+fn serving(io: std.Io, gguf: []const u8) bool {
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/models", .{port}) catch return false;
+    var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
+    defer client.deinit();
+    var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer aw.deinit();
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &aw.writer,
+    }) catch return false;
+    if (result.status != .ok) return false;
+    return isOurModel(aw.written(), gguf);
+}
+
+/// Whether anything answers on our port at all. Used to refuse a port held
+/// by another service rather than spawning a second server that will fail
+/// to bind and leave us health-checking the wrong process.
+fn occupied(io: std.Io) bool {
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/health", .{port}) catch return false;
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
     defer client.deinit();
     var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
@@ -296,4 +362,19 @@ test "a body of the wrong width is refused" {
     defer arena.deinit();
     var out: [1][]f32 = undefined;
     try t.expectError(error.WrongDimension, parseVectors(arena.allocator(), "{\"data\":[{\"embedding\":[1.0,2.0]}]}", &out));
+}
+
+test "a port is only ours if it names our model" {
+    const t = std.testing;
+    const gguf = "/home/me/.nanolight/models/embeddinggemma-2-Q8_0.gguf";
+    try t.expect(isOurModel(
+        "{\"data\":[{\"id\":\"" ++ "/home/me/.nanolight/models/embeddinggemma-2-Q8_0.gguf" ++ "\"}]}",
+        gguf,
+    ));
+    // A different model on our port must not be accepted.
+    try t.expect(!isOurModel("{\"data\":[{\"id\":\"/tmp/other.gguf\"}]}", gguf));
+    // Nor an empty or unrelated reply.
+    try t.expect(!isOurModel("", gguf));
+    try t.expect(!isOurModel("{\"status\":\"ok\"}", gguf));
+    try t.expect(!isOurModel("{}", ""));
 }

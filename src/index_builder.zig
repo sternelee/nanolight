@@ -136,8 +136,9 @@ pub const Job = struct {
         if (job.found.items.len == 0) return;
 
         // 2. Embed every piece, in batches the model can take at once.
-        var srv: runtime.Server = .{};
-        defer srv.stop(io);
+        // Share the app's server with queries: starting a second one on
+        // the same port used to make both fight over it.
+        const srv = &l.meaning.server;
         if (!srv.ensure(io, gpa)) {
             l.meaning_indexing.problem = "The model did not start";
             return;

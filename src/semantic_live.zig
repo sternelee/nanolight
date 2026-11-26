@@ -27,8 +27,12 @@ pub const State = struct {
     /// A download is running, and how far it got.
     fetching: bool = false,
     progress: download.Progress = .{},
-    /// The runtime, started on the first search that needs it.
+    /// The runtime, started on the first search that needs it and kept
+    /// until idle. Shared by queries and the index builder.
     server: runtime.Server = .{},
+    /// Token for the pending idle stop: a callback whose token is stale
+    /// does nothing, so a new query cancels the old timer.
+    idle_token: u64 = 0,
     /// The index, read once and kept.
     index: vectors.Index = .{},
     index_loaded: bool = false,
@@ -157,6 +161,32 @@ const FetchJob = struct {
     }
 };
 
+/// A queued idle stop. Held on the heap because `App.after` keeps only the
+/// context pointer; a stale token means a newer query superseded it.
+const IdleStop = struct {
+    live: *Live,
+    token: u64,
+
+    fn fire(ctx: ?*anyopaque) callconv(.c) void {
+        const stop: *IdleStop = @ptrCast(@alignCast(ctx.?));
+        const l = stop.live;
+        defer l.app.gpa.destroy(stop);
+        // A newer query bumped the token: this timer is obsolete.
+        if (stop.token != l.meaning.idle_token) return;
+        l.meaning.server.stop(l.app.io);
+        if (l.window) |w| w.redraw();
+    }
+};
+
+/// Schedules a stop after `runtime.idle_ms`. Called on the main thread when
+/// a query finishes; the next query invalidates it by bumping the token.
+fn scheduleIdleStop(l: *Live) void {
+    l.meaning.idle_token +%= 1;
+    const stop = l.app.gpa.create(IdleStop) catch return;
+    stop.* = .{ .live = l, .token = l.meaning.idle_token };
+    nanoui.App.after(runtime.idle_ms, stop, IdleStop.fire);
+}
+
 /// Whether a finished worker should ask again: the field's words changed
 /// while it was out. Kept pure so the continuous-typing path can be tested
 /// without spawning threads or loading a model.
@@ -183,6 +213,8 @@ pub fn ask(ctx: *anyopaque, q: []const u8) void {
 /// Starts a worker for the words currently in `asking`. Main thread only.
 fn dispatch(l: *Live) void {
     if (l.meaning.busy or l.meaning.asking_len == 0) return;
+    // A query is using the server again: any queued idle stop is stale.
+    l.meaning.idle_token +%= 1;
     const job = l.app.gpa.create(AskJob) catch return;
     job.* = .{ .live = l, .len = l.meaning.asking_len, .epoch = l.meaning.epoch };
     @memcpy(job.text[0..job.len], l.meaning.asking[0..job.len]);
@@ -205,7 +237,7 @@ const AskJob = struct {
 
     /// Only the model call: no `Live` state is touched here.
     fn run(job: *AskJob) void {
-        job.got = embedOne(job.live.app.io, job.live.app.gpa, job.text[0..job.len], &job.vec);
+        job.got = embedOne(&job.live.meaning.server, job.live.app.io, job.live.app.gpa, job.text[0..job.len], &job.vec);
         // Back to the main thread for everything else.
         nanoui.App.after(0, job, finish);
     }
@@ -234,15 +266,17 @@ const AskJob = struct {
         if (l.window) |w| w.redraw();
         // If words changed while this was out, ask for them now. This is
         // what makes continuous typing end with the right answer.
-        if (shouldRedispatch(job.epoch, l.meaning.epoch)) dispatch(l);
+        if (shouldRedispatch(job.epoch, l.meaning.epoch)) {
+            dispatch(l);
+        } else {
+            scheduleIdleStop(l);
+        }
     }
 };
 
 /// One text's vector, from the runtime. False when the server or the model
 /// is not there, or the answer is not a vector.
-fn embedOne(io: std.Io, gpa: std.mem.Allocator, text: []const u8, out: *[vectors.dimension]f32) bool {
-    var srv: runtime.Server = .{};
-    defer srv.stop(io);
+fn embedOne(srv: *runtime.Server, io: std.Io, gpa: std.mem.Allocator, text: []const u8, out: *[vectors.dimension]f32) bool {
     if (!srv.ensure(io, gpa)) return false;
 
     var qbuf: [512]u8 = undefined;

@@ -89,13 +89,17 @@ code evidence, not style notes. Ordered by severity.
   `ask` bumps the epoch and returns when a worker is out; that worker's
   `finish` sees the new epoch and calls `dispatch` for the words now in the
   field. `shouldRedispatch()` is a pure helper with a test.
-- [ ] **Fixed port 18099, no ownership check** (`embed_runtime.zig:90`,
-  `:130-163`). A query and an index build both spawn a server on the same
-  port; `wait()` health-checks the URL, not the child, so it can report
-  success against another process's server.
-- [ ] **A new server per query** (`semantic_live.zig:208-210`). The module
-  doc says the server is started once and kept; in fact every query loads
-  310 MB, waits, embeds, and kills it.
+- [x] **Port ownership is now checked** (`embed_runtime.zig`). A /health
+  200 is not enough: `ensure` reads `/v1/models` and only accepts a server
+  whose model path is our GGUF (`isOurModel`, with a test). A different
+  service on the port is refused rather than silently used. A mutex keeps
+  the query and index-builder workers from starting/stopping at once.
+- [x] **One server, kept and stopped when idle** (`semantic_live.zig`,
+  `index_builder.zig`). The server lives in `Live.meaning.server`; queries
+  and the index build share it. A query invalidates a queued idle stop by
+  bumping a token, and a finished query schedules a stop after 30 s to
+  return the model's ~0.25 GB. Measured: first ensure 1876 ms, second
+  ensure 0 ms, after stop 1463 ms -- the old code paid ~1.5 s per query.
 - [ ] **Detached threads outlive `Live`** (`semantic_live.zig:107,166`,
   `index_builder.zig:86`). `Live` is a stack value in `main`; on quit the
   detached workers still dereference it. No cancellation or join.
@@ -173,7 +177,7 @@ code evidence, not style notes. Ordered by severity.
 
 ## Verification so far
 
-- `zig build test-bin`: 137 passed, 1 skipped, 0 failed.
+- `zig build test-bin`: 138 passed, 1 skipped, 0 failed.
 - `zig build`, `zig build film`, Windows and Linux cross-compiles: all exit 0.
 - End-to-end probes against a real model: download + SHA-256, server start,
   embed, index, query. A dog query ranked a dog file 0.776 and a budget file
