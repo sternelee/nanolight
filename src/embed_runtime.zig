@@ -251,6 +251,14 @@ fn occupied(io: std.Io) bool {
     return result.status == .ok;
 }
 
+/// The most bytes one input can occupy in a JSON body: every byte escaped
+/// as `\u00xx` is six, plus the two surrounding quotes and a separator.
+pub fn jsonBound(input_bytes: usize, count: usize) usize {
+    // `{"input":[` is 10 bytes, `]}` is 2, and each input adds its quotes
+    // and a separator on top of six bytes per worst-case character.
+    return 12 + count * (3 + input_bytes * 6);
+}
+
 /// The JSON body for an embedding request: the inputs, as one array.
 pub fn requestBody(buf: []u8, inputs: []const []const u8) ?[]const u8 {
     var w = std.Io.Writer.fixed(buf);
@@ -377,4 +385,28 @@ test "a port is only ours if it names our model" {
     try t.expect(!isOurModel("", gguf));
     try t.expect(!isOurModel("{\"status\":\"ok\"}", gguf));
     try t.expect(!isOurModel("{}", ""));
+}
+
+test "a body of all control bytes fits its documented bound" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    // Every byte escapes to six characters: the worst case jsonBound covers.
+    const worst = try gpa.alloc(u8, 1400);
+    defer gpa.free(worst);
+    @memset(worst, 0x01);
+    const inputs = [_][]const u8{ worst, worst };
+    const size = jsonBound(worst.len, inputs.len);
+    const buf = try gpa.alloc(u8, size);
+    defer gpa.free(buf);
+    const body = requestBody(buf, &inputs).?;
+    // It is valid JSON and round-trips to the same bytes.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), body, .{});
+    const arr = parsed.value.object.get("input").?.array;
+    try t.expectEqual(@as(usize, 2), arr.items.len);
+    try t.expectEqual(worst.len, arr.items[0].string.len);
+    try t.expectEqual(@as(u8, 0x01), arr.items[0].string[0]);
+    // And the bound is tight enough to be useful, not absurdly large.
+    try t.expect(size < 64 * 1024);
 }

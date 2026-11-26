@@ -100,9 +100,12 @@ code evidence, not style notes. Ordered by severity.
   bumping a token, and a finished query schedules a stop after 30 s to
   return the model's ~0.25 GB. Measured: first ensure 1876 ms, second
   ensure 0 ms, after stop 1463 ms -- the old code paid ~1.5 s per query.
-- [ ] **Detached threads outlive `Live`** (`semantic_live.zig:107,166`,
-  `index_builder.zig:86`). `Live` is a stack value in `main`; on quit the
-  detached workers still dereference it. No cancellation or join.
+- [ ] **Detached threads outlive `Live` — known limitation, not fixed here.**
+  `Live` is a stack value in `main`; on quit the detached workers and
+  `App.after` callbacks still dereference it. This predates meaning search
+  (`files_live.zig` has detached workers too; there are 18 `App.after`
+  call sites). A correct fix needs a shared lifetime token across the app,
+  not a local patch to one feature. Left explicit rather than half-fixed.
 - [x] **`search` no longer underflows on an empty `out`**
   (`vector_index.zig`). Returns zero before the `out[n - 1]` comparison;
   the test aborts with signal ABRT on the old code.
@@ -110,23 +113,28 @@ code evidence, not style notes. Ordered by severity.
   A record needs at least 19 bytes; a claimed count larger than the bytes
   allow is refused as `Truncated` before any allocation. Test uses a
   36-byte file claiming `0xFFFFFFFF` records.
-- [ ] **Fingerprint ignores the prompts it claims to cover**
-  (`embed_model.zig:58-72`). Changing prompt wording without bumping `:v1`
-  silently invalidates recall. The `Index.model` field is written but never
-  compared on load.
-- [ ] **`problem` out-param has no length** (`model_download.zig:104-155`,
-  `semantic_live.zig:146`). Callers copy all 96 bytes, so the message
-  carries ~70 trailing NULs and `len > 0` is always true.
-- [ ] **Request bodies can overflow** (`index_builder.zig:200`,
-  `semantic_live.zig:214`). JSON escaping doubles quotes/backslashes and
-  sextuples control bytes; a batch of 16 quote-heavy chunks exceeds
-  `body_buf` and aborts the build.
-- [ ] **Long basenames silently drop a chunk** (`index_builder.zig:156`).
-  `documentText` returns null past ~240 bytes of title and the piece is
-  skipped.
-- [ ] **No download timeout or cancel** (`model_download.zig:160-214`).
-  A stalled server blocks the worker forever; `fetching` stays true and
-  retries are refused.
+- [x] **The fingerprint now covers the prompts** (`embed_model.zig`,
+  `vector_index.zig`). Prompt wording lives in constants used both by the
+  builders and by the fingerprint seed, so changing a prompt changes the
+  fingerprint; the full revision is hashed too. `Index.loadFor` refuses an
+  index made by a different fingerprint instead of scoring incomparable
+  vectors. Tests cover both.
+- [x] **`problem` carries its real length** (`model_download.zig`).
+  `Progress.setProblem` records the message and its length; the bare
+  `[]u8` out-param is gone. `Progress.problem()` no longer returns NUL
+  padding, and an empty message has length zero.
+- [x] **Request bodies are sized for the worst case** (`embed_runtime.zig`,
+  `index_builder.zig`, `semantic_live.zig`). `jsonBound` counts six bytes
+  per escaped control character; buffers use it. A test encodes 1400
+  control bytes and round-trips them through `std.json`. It also caught
+  the first bound being two bytes short.
+- [x] **A long basename no longer drops its chunk** (`embed_model.zig`).
+  `documentText` trims the title to what fits, keeping the body intact.
+- [x] **Downloads have a wall-clock deadline** (`model_download.zig`).
+  The fetch is split into bounded 8 MB range requests; the loop checks a
+  10-minute deadline between chunks, and bytes already written stay in
+  `.partial` for the next try. Verified with a 100-byte chunk size over a
+  410-byte file (five requests) and with the normal 8 MB size.
 
 ### Low
 
@@ -171,13 +179,13 @@ code evidence, not style notes. Ordered by severity.
 - [ ] **Incremental indexing**: a build rewrites the whole index. Changed
   files are re-read on the next full build; there is no watcher or per-file
   update yet.
-- [ ] **Commit**: all of this is uncommitted on `embedding` (8 new modules
-  plus edits to main/view/results/settings/build).
+- [x] **Commit**: the work is committed on `embedding` in six commits
+  (`e1624d0` through `bd1b817`), plus the two earlier file-search fixes.
 - [ ] **Push**: `origin/embedding` does not exist yet.
 
 ## Verification so far
 
-- `zig build test-bin`: 138 passed, 1 skipped, 0 failed.
+- `zig build test-bin`: 144 passed, 1 skipped, 0 failed.
 - `zig build`, `zig build film`, Windows and Linux cross-compiles: all exit 0.
 - End-to-end probes against a real model: download + SHA-256, server start,
   embed, index, query. A dog query ranked a dog file 0.776 and a budget file

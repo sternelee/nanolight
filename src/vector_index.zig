@@ -44,6 +44,9 @@ pub const Hit = struct {
 
 pub const Error = error{
     NotAnIndex,
+    /// Made by another model or another prompt wording: its vectors are
+    /// not comparable with these.
+    WrongModel,
     WrongDimension,
     Truncated,
     OutOfMemory,
@@ -88,6 +91,17 @@ pub const Index = struct {
         if (!std.mem.eql(u8, bytes[0..magic.len], &magic)) return error.NotAnIndex;
         if (bytes.len < header_bytes) return error.Truncated;
         try ix.parse();
+        return ix;
+    }
+
+    /// Reads a vectors file only when it was made by the same model and
+    /// prompts. An index from another fingerprint is not scored against
+    /// these vectors: its numbers mean something else. A missing file is
+    /// still an empty index.
+    pub fn loadFor(io: std.Io, gpa: std.mem.Allocator, path: []const u8, want: [16]u8) !Index {
+        var ix = try load(io, gpa, path);
+        errdefer ix.deinit();
+        if (ix.count > 0 and !std.mem.eql(u8, &ix.model, &want)) return error.WrongModel;
         return ix;
     }
 
@@ -481,4 +495,31 @@ test "a lying record count is refused before allocating" {
     const file = tmpPath(&tmp, &buf, "lying.idx");
     try tmp.dir.writeFile(t.io, .{ .sub_path = "lying.idx", .data = &raw });
     try t.expectError(error.Truncated, Index.load(t.io, gpa, file));
+}
+
+test "an index from another model or prompt is refused, not scored" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const file = tmpPath(&tmp, &buf, "foreign.idx");
+    var vec: [dimension]f32 = undefined;
+    @memset(&vec, 0);
+    vec[0] = 1;
+    // Built with one fingerprint...
+    var b = try Builder.init(gpa, @splat('a'));
+    defer b.deinit();
+    try b.add("/a.txt", .text, .{}, &vec);
+    try b.save(t.io, file);
+    // ...and read with another: its vectors mean something else.
+    try t.expectError(error.WrongModel, Index.loadFor(t.io, gpa, file, @splat('b')));
+    // The matching fingerprint is accepted.
+    var ix = try Index.loadFor(t.io, gpa, file, @splat('a'));
+    defer ix.deinit();
+    try t.expectEqual(@as(usize, 1), ix.count);
+    // An empty index has no vectors to misread, so any fingerprint loads.
+    var empty = try Index.loadFor(t.io, gpa, "/nonexistent/nanolight/none.idx", @splat('z'));
+    defer empty.deinit();
+    try t.expectEqual(@as(usize, 0), empty.count);
 }

@@ -119,8 +119,6 @@ const FetchJob = struct {
     dir: [model.max_path]u8 = undefined,
     dir_len: usize = 0,
     progress: download.Progress = .{},
-    problem: [128]u8 = @splat(0),
-    problem_len: usize = 0,
     ok: bool = false,
 
     fn run(job: *FetchJob) void {
@@ -134,9 +132,8 @@ const FetchJob = struct {
         job.ok = true;
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            if (!download.fetchOne(io, gpa, dir, out[i], &job.progress, &job.problem)) {
+            if (!download.fetchOne(io, gpa, dir, out[i], &job.progress)) {
                 job.ok = false;
-                job.problem_len = @min(std.mem.sliceTo(&job.problem, 0).len, job.problem.len);
                 break;
             }
         }
@@ -150,12 +147,7 @@ const FetchJob = struct {
         defer l.app.gpa.destroy(job);
         l.meaning.fetching = false;
         l.meaning.ready = job.ok and runtime.ready(l.app.io);
-        l.meaning.progress = job.progress;
-        if (!job.ok) {
-            const n = @min(job.problem_len, l.meaning.progress.problem_buf.len);
-            @memcpy(l.meaning.progress.problem_buf[0..n], job.problem[0..n]);
-            l.meaning.progress.problem_len = n;
-        }
+        l.meaning.progress = job.progress; // carries its own problem text and length
         l.meaning.progress.phase = if (job.ok) .ready else .failed;
         if (l.window) |w| w.redraw();
     }
@@ -254,7 +246,7 @@ const AskJob = struct {
                 var path_buf: [model.max_path]u8 = undefined;
                 const path = indexPath(&path_buf);
                 if (path.len > 0) {
-                    l.meaning.index = vectors.Index.load(l.app.io, l.app.gpa, path) catch .{ .gpa = l.app.gpa };
+                    l.meaning.index = vectors.Index.loadFor(l.app.io, l.app.gpa, path, model.fingerprint) catch .{ .gpa = l.app.gpa };
                 }
                 l.meaning.index_loaded = true;
             }
@@ -281,7 +273,7 @@ fn embedOne(srv: *runtime.Server, io: std.Io, gpa: std.mem.Allocator, text: []co
 
     var qbuf: [512]u8 = undefined;
     const framed = model.queryText(&qbuf, text) orelse return false;
-    var body_buf: [1024]u8 = undefined;
+    var body_buf: [runtime.jsonBound(512, 1)]u8 = undefined;
     const body = runtime.requestBody(&body_buf, &.{framed}) orelse return false;
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };

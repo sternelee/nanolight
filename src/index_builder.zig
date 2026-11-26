@@ -175,7 +175,7 @@ pub const Job = struct {
         };
         // The next search reads it.
         l.meaning.index.deinit();
-        l.meaning.index = vectors.Index.load(io, gpa, path) catch .{ .gpa = gpa };
+        l.meaning.index = vectors.Index.loadFor(io, gpa, path, model.fingerprint) catch .{ .gpa = gpa };
         l.meaning.index_loaded = true;
         l.meaning_indexing.files_indexed = job.found.items.len;
     }
@@ -201,7 +201,10 @@ fn flush(
     defer for (batch[0..to_free]) |p| gpa.free(p.owner);
     var texts: [batch_size][]const u8 = undefined;
     for (batch[0..count.*], 0..) |p, i| texts[i] = p.framed;
-    var body_buf: [batch_size * (extract.chunk_chars + 256)]u8 = undefined;
+    // Worst case: every byte of every framed input is a control character
+    // escaped to six bytes. The old bound assumed plain text and aborted
+    // the whole build on a batch full of quotes or control bytes.
+    var body_buf: [runtime.jsonBound(extract.chunk_chars + 256, batch_size)]u8 = undefined;
     const body = runtime.requestBody(&body_buf, texts[0..count.*]) orelse return fail(l, "The request was too large");
     var client: std.http.Client = .{ .allocator = gpa, .io = l.app.io };
     defer client.deinit();

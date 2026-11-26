@@ -11,6 +11,13 @@
 const std = @import("std");
 const model = @import("embed_model.zig");
 
+/// Each range request asks for at most this much. A stalled connection can
+/// then only hold up one chunk, and progress is checkable between chunks.
+pub const chunk_bytes: u64 = 8 << 20;
+/// Give up on a model download after this long in one run. Bytes already
+/// written stay in `.partial`, so the next try resumes from them.
+pub const deadline_ms: i64 = 10 * 60 * 1000;
+
 pub const Phase = enum { needed, downloading, verifying, failed, ready };
 
 pub const Progress = struct {
@@ -27,6 +34,14 @@ pub const Progress = struct {
 
     pub fn problem(p: *const Progress) []const u8 {
         return p.problem_buf[0..p.problem_len];
+    }
+
+    /// Records why a fetch stopped, with its real length: callers must not
+    /// copy the whole buffer and render a string of NULs.
+    pub fn setProblem(p: *Progress, msg: []const u8) void {
+        const n = @min(msg.len, p.problem_buf.len);
+        @memcpy(p.problem_buf[0..n], msg[0..n]);
+        p.problem_len = n;
     }
 
     pub fn fraction(p: *const Progress) f64 {
@@ -107,11 +122,10 @@ pub fn fetchOne(
     dir: []const u8,
     f: model.File,
     prog: *Progress,
-    problem: []u8,
 ) bool {
     var url_buf: [512]u8 = undefined;
     const url = model.url(&url_buf, f) orelse {
-        @memcpy(problem[0.."bad url".len], "bad url");
+        prog.setProblem("bad url");
         return false;
     };
     var path_buf: [model.max_path]u8 = undefined;
@@ -132,24 +146,24 @@ pub fn fetchOne(
     if (have < f.bytes) {
         prog.phase = .downloading;
         prog.file = f.name;
-        if (!download(io, gpa, url, partial, have, f.bytes, prog, problem)) return false;
+        if (!download(io, gpa, url, partial, have, f.bytes, prog)) return false;
     }
 
     // Named only when it is whole: a file under its real name is trusted.
     prog.phase = .verifying;
     var hex: [64]u8 = undefined;
     sha256(io, partial, &hex) catch {
-        @memcpy(problem[0.."cannot read the download".len], "cannot read the download");
+        prog.setProblem("cannot read the download");
         return false;
     };
     if (!std.mem.eql(u8, &hex, f.sha256)) {
         // A damaged file is thrown away: the next try starts clean.
         std.Io.Dir.cwd().deleteFile(io, partial) catch {};
-        @memcpy(problem[0.."the download was damaged".len], "the download was damaged");
+        prog.setProblem("the download was damaged");
         return false;
     }
     std.Io.Dir.renameAbsolute(partial, final, io) catch {
-        @memcpy(problem[0.."cannot keep the download".len], "cannot keep the download");
+        prog.setProblem("cannot keep the download");
         return false;
     };
     return true;
@@ -172,14 +186,15 @@ pub fn placement(status: std.http.Status, have: u64) Placement {
     };
 }
 
-/// The bytes themselves, appended to `partial` from `have` on. A range
-/// request, so an interrupted download costs only what it had not reached.
+/// The bytes themselves, appended to `partial` from `have` on. Fetched in
+/// bounded range requests: a stalled connection can hold up one chunk, and
+/// the loop can check the wall clock between chunks. Bytes already written
+/// stay in `.partial`, so any interruption resumes from them.
 ///
 /// The response head is read before any body is written, so a resumed
 /// download (206) appends at `have` while a full response (200, the server
 /// ignored the range) starts the file over. An error response writes
-/// nothing at all. `fetch` cannot do this: it streams the body into the
-/// writer before returning the status.
+/// nothing at all.
 fn download(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -188,20 +203,44 @@ fn download(
     have: u64,
     want: u64,
     prog: *Progress,
-    problem: []u8,
+) bool {
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    var offset = have;
+    while (offset < want) {
+        if (std.Io.Clock.awake.now(io).toMilliseconds() - started > deadline_ms) {
+            prog.setProblem("the download took too long; it will resume");
+            return false;
+        }
+        const end = @min(offset + chunk_bytes, want) - 1;
+        if (!fetchChunk(io, gpa, url, partial, offset, end, want, prog)) return false;
+        offset = end + 1;
+    }
+    return true;
+}
+
+/// One bounded range request, written at `offset`.
+fn fetchChunk(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    url: []const u8,
+    partial: []const u8,
+    offset: u64,
+    end: u64,
+    want: u64,
+    prog: *Progress,
 ) bool {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var range_buf: [64]u8 = undefined;
-    const range = std.fmt.bufPrint(&range_buf, "bytes={d}-", .{have}) catch return false;
+    const range = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, end }) catch return false;
     var headers = [_]std.http.Header{
         .{ .name = "Range", .value = range },
         .{ .name = "Accept", .value = "application/octet-stream" },
     };
 
     const uri = std.Uri.parse(url) catch {
-        @memcpy(problem[0.."bad model address".len], "bad model address");
+        prog.setProblem("bad model address");
         return false;
     };
     var req = client.request(.GET, uri, .{
@@ -212,53 +251,56 @@ fn download(
         // decoded bytes and fail the size and SHA-256 checks.
         .headers = .{ .accept_encoding = .omit },
     }) catch {
-        @memcpy(problem[0.."the network did not answer".len], "the network did not answer");
+        prog.setProblem("the network did not answer");
         return false;
     };
     defer req.deinit();
     req.sendBodiless() catch {
-        @memcpy(problem[0.."the network did not answer".len], "the network did not answer");
+        prog.setProblem("the network did not answer");
         return false;
     };
 
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch {
-        @memcpy(problem[0.."the network did not answer".len], "the network did not answer");
+        prog.setProblem("the network did not answer");
         return false;
     };
 
-    // Decide where the bytes go from the status, before writing any.
-    const where = placement(response.head.status, have);
-    const offset: u64 = switch (where) {
-        .append => |at| at, // 206: keep what an earlier run wrote
-        .restart => 0,      // 200: the server ignored the range
+    // A bounded range must be answered with 206. A 200 means the server
+    // ignored it and sent the whole file; that is only safe from offset 0.
+    const where = placement(response.head.status, offset);
+    const at: u64 = switch (where) {
+        .append => |v| v,
+        .restart => 0,
         .refuse => {
-            @memcpy(problem[0.."the server refused the download".len], "the server refused the download");
+            prog.setProblem("the server refused the download");
             return false;
         },
     };
+    if (at != offset) {
+        prog.setProblem("the server ignored a partial range");
+        return false;
+    }
 
     const file = std.Io.Dir.cwd().createFile(io, partial, .{ .truncate = offset == 0 }) catch {
-        @memcpy(problem[0.."cannot write the download".len], "cannot write the download");
+        prog.setProblem("cannot write the download");
         return false;
     };
     defer file.close(io);
-    // FileSink writes positionally at `offset`, so no separate seek is
-    // needed: a 206 appends after the bytes an earlier run left, a 200
-    // overwrites from the start.
-    var sink = FileSink.init(io, file, offset, prog, prog.received -| offset);
+    // FileSink writes positionally at `at`, so no separate seek is needed.
+    var sink = FileSink.init(io, file, at, prog, prog.received -| at);
     var transfer_buf: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
     _ = reader.streamRemaining(&sink.writer) catch {
         // What arrived stays on disk; the next try resumes from it.
-        @memcpy(problem[0.."the network did not answer".len], "the network did not answer");
+        prog.setProblem("the network did not answer");
         return false;
     };
 
-    if (sink.offset != want) {
-        @memcpy(problem[0.."the download stopped short".len], "the download stopped short");
+    if (sink.offset != @min(end + 1, want)) {
+        prog.setProblem("the download stopped short");
         return false;
     }
     return true;
@@ -395,4 +437,21 @@ test "an error response refuses the body, so it cannot poison the partial" {
             else => return error.WrongPlacement,
         }
     }
+}
+
+test "a problem is recorded with its real length, not a NUL-padded buffer" {
+    const t = std.testing;
+    var p: Progress = .{};
+    p.setProblem("the download was damaged");
+    try t.expectEqualStrings("the download was damaged", p.problem());
+    try t.expectEqual(@as(usize, "the download was damaged".len), p.problem_len);
+    // A longer message than the buffer is truncated, but still has no NULs.
+    var long: [200]u8 = undefined;
+    @memset(&long, 'x');
+    p.setProblem(&long);
+    try t.expectEqual(@as(usize, p.problem_buf.len), p.problem().len);
+    try t.expect(std.mem.indexOfScalar(u8, p.problem(), 0) == null);
+    // Clearing sets the length to zero, so `len > 0` is not always true.
+    p.setProblem("");
+    try t.expectEqual(@as(usize, 0), p.problem().len);
 }
