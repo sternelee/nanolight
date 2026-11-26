@@ -107,12 +107,17 @@ pub fn fetch(ctx: *anyopaque) void {
     thread.detach();
 }
 
-/// One download, off the main thread. It reports back through `nanoui.App.after`
-/// so everything it touches is touched on the main thread.
+/// One download, off the main thread. The worker uses its own progress
+/// buffer; every `Live` field is written back on the main thread in
+/// `finish`, through `App.after`.
 const FetchJob = struct {
     live: *Live,
     dir: [model.max_path]u8 = undefined,
     dir_len: usize = 0,
+    progress: download.Progress = .{},
+    problem: [128]u8 = @splat(0),
+    problem_len: usize = 0,
+    ok: bool = false,
 
     fn run(job: *FetchJob) void {
         const l = job.live;
@@ -122,41 +127,65 @@ const FetchJob = struct {
         std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         var out: [model.all.len]model.File = undefined;
         const n = download.missing(io, dir, &out);
-        var problem: [128]u8 = @splat(0);
-        var ok = true;
+        job.ok = true;
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            if (!download.fetchOne(io, gpa, dir, out[i], &l.meaning.progress, &problem)) {
-                ok = false;
+            if (!download.fetchOne(io, gpa, dir, out[i], &job.progress, &job.problem)) {
+                job.ok = false;
+                job.problem_len = @min(std.mem.sliceTo(&job.problem, 0).len, job.problem.len);
                 break;
             }
         }
-        // Back on the main thread, where the panel is.
+        // Back on the main thread for anything the UI can see.
+        nanoui.App.after(0, job, finish);
+    }
+
+    fn finish(ctx: ?*anyopaque) callconv(.c) void {
+        const job: *FetchJob = @ptrCast(@alignCast(ctx.?));
+        const l = job.live;
+        defer l.app.gpa.destroy(job);
         l.meaning.fetching = false;
-        l.meaning.ready = ok and runtime.ready(io);
-        if (!ok) {
-            const n_problem = @min(problem.len, l.meaning.progress.problem_buf.len);
-            @memcpy(l.meaning.progress.problem_buf[0..n_problem], problem[0..n_problem]);
-            l.meaning.progress.problem_len = n_problem;
+        l.meaning.ready = job.ok and runtime.ready(l.app.io);
+        l.meaning.progress = job.progress;
+        if (!job.ok) {
+            const n = @min(job.problem_len, l.meaning.progress.problem_buf.len);
+            @memcpy(l.meaning.progress.problem_buf[0..n], job.problem[0..n]);
+            l.meaning.progress.problem_len = n;
         }
-        l.meaning.progress.phase = if (ok) .ready else .failed;
+        l.meaning.progress.phase = if (job.ok) .ready else .failed;
         if (l.window) |w| w.redraw();
-        gpa.destroy(job);
     }
 };
 
-/// The query's vector, asked of the model. The answer comes back through
-/// `nanoui.App.after`, on the main thread.
+/// Whether a finished worker should ask again: the field's words changed
+/// while it was out. Kept pure so the continuous-typing path can be tested
+/// without spawning threads or loading a model.
+pub fn shouldRedispatch(job_epoch: u64, current_epoch: u64) bool {
+    return job_epoch != current_epoch;
+}
+
+/// The query's vector, asked of the model. Only the model call is on a
+/// worker; every change to `Live` happens back on the main thread through
+/// `App.after`, so the UI never races the worker.
 pub fn ask(ctx: *anyopaque, q: []const u8) void {
     const l: *Live = @ptrCast(@alignCast(ctx));
     if (!l.s.meaning_on or !l.meaning.ready or q.len == 0 or q.len >= l.meaning.asking.len) return;
     @memcpy(l.meaning.asking[0..q.len], q);
     l.meaning.asking_len = q.len;
     l.meaning.epoch +%= 1;
+    // A worker already out: its `finish` will see the new epoch and ask
+    // again for the words now in the field. Returning here without that
+    // would leave the new query with no answer at all.
     if (l.meaning.busy) return;
+    dispatch(l);
+}
+
+/// Starts a worker for the words currently in `asking`. Main thread only.
+fn dispatch(l: *Live) void {
+    if (l.meaning.busy or l.meaning.asking_len == 0) return;
     const job = l.app.gpa.create(AskJob) catch return;
-    job.* = .{ .live = l, .len = q.len, .epoch = l.meaning.epoch };
-    @memcpy(job.text[0..q.len], q);
+    job.* = .{ .live = l, .len = l.meaning.asking_len, .epoch = l.meaning.epoch };
+    @memcpy(job.text[0..job.len], l.meaning.asking[0..job.len]);
     l.meaning.busy = true;
     const thread = std.Thread.spawn(.{}, AskJob.run, .{job}) catch {
         l.meaning.busy = false;
@@ -171,34 +200,41 @@ const AskJob = struct {
     text: [256]u8 = undefined,
     len: usize,
     epoch: u64,
+    got: bool = false,
+    vec: [@import("vector_index.zig").dimension]f32 = undefined,
 
+    /// Only the model call: no `Live` state is touched here.
     fn run(job: *AskJob) void {
+        job.got = embedOne(job.live.app.io, job.live.app.gpa, job.text[0..job.len], &job.vec);
+        // Back to the main thread for everything else.
+        nanoui.App.after(0, job, finish);
+    }
+
+    fn finish(ctx: ?*anyopaque) callconv(.c) void {
+        const job: *AskJob = @ptrCast(@alignCast(ctx.?));
         const l = job.live;
-        const io = l.app.io;
-        const gpa = l.app.gpa;
-        var vec_buf: [vectors.dimension]f32 = undefined;
-        const got = embedOne(io, gpa, job.text[0..job.len], &vec_buf);
+        defer l.app.gpa.destroy(job);
         l.meaning.busy = false;
-        if (!got) {
-            if (l.window) |w| w.redraw();
-            gpa.destroy(job);
-            return;
-        }
-        // The index, read once.
-        if (!l.meaning.index_loaded) {
-            var path_buf: [model.max_path]u8 = undefined;
-            const path = indexPath(&path_buf);
-            if (path.len > 0) {
-                l.meaning.index = vectors.Index.load(io, gpa, path) catch .{ .gpa = gpa };
+
+        if (job.got) {
+            // The index, read once on the main thread.
+            if (!l.meaning.index_loaded) {
+                var path_buf: [model.max_path]u8 = undefined;
+                const path = indexPath(&path_buf);
+                if (path.len > 0) {
+                    l.meaning.index = vectors.Index.load(l.app.io, l.app.gpa, path) catch .{ .gpa = l.app.gpa };
+                }
+                l.meaning.index_loaded = true;
             }
-            l.meaning.index_loaded = true;
+            // Only a vector for the words still in the field counts.
+            if (job.epoch == l.meaning.epoch) {
+                l.s.meaningAnswered(job.text[0..job.len], &job.vec, &l.meaning.index);
+            }
         }
-        // Only the query still in the field counts.
-        if (job.epoch == l.meaning.epoch) {
-            l.s.meaningAnswered(job.text[0..job.len], &vec_buf, &l.meaning.index);
-            if (l.window) |w| w.redraw();
-        }
-        gpa.destroy(job);
+        if (l.window) |w| w.redraw();
+        // If words changed while this was out, ask for them now. This is
+        // what makes continuous typing end with the right answer.
+        if (shouldRedispatch(job.epoch, l.meaning.epoch)) dispatch(l);
     }
 };
 
@@ -246,4 +282,17 @@ test "the index lives beside the model" {
     if (path.len == 0) return error.SkipZigTest;
     try t.expect(std.mem.endsWith(u8, path, index_name));
     try t.expect(std.mem.indexOf(u8, path, ".nanolight/models") != null);
+}
+
+test "typing while a worker is out asks again for the new words" {
+    const t = std.testing;
+    // The bug: `ask` bumped the epoch and returned when busy, and the
+    // in-flight answer was dropped on the mismatch, leaving no worker for
+    // the new words. `finish` now re-dispatches when the epoch moved.
+    try t.expect(!shouldRedispatch(7, 7));   // no typing: keep the answer
+    try t.expect(shouldRedispatch(7, 8));    // one new query: ask again
+    try t.expect(shouldRedispatch(7, 11));   // several: still ask again
+    // Epoch wraps on overflow; equality is still the only thing that
+    // decides whether the answer matches the field.
+    try t.expect(!shouldRedispatch(std.math.maxInt(u64), std.math.maxInt(u64)));
 }

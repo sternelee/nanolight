@@ -80,15 +80,15 @@ code evidence, not style notes. Ordered by severity.
 
 ### Medium
 
-- [ ] **Data races on `Live.meaning*`** (`semantic_live.zig:129-143`,
-  `:181-199`, `index_builder.zig:94-100`). Background threads write
-  progress, `fetching`, `ready`, `busy`, `index`, `index_loaded`; the main
-  thread reads them in `state()` and the Settings UI. No atomics, no lock.
-  `App.after` is not used despite the comment saying so.
-- [ ] **A query typed while busy is never embedded** (`semantic_live.zig:155-156`,
-  `:181,197`). `ask` bumps the epoch then returns early when `busy`; the
-  in-flight job's answer is dropped on the epoch mismatch, and nothing
-  re-asks for the new query.
+- [x] **Data races on `Live.meaning*` fixed for the query and download
+  workers** (`semantic_live.zig`). `AskJob.run` and `FetchJob.run` now only
+  use the worker's own buffers and call `App.after(0, ...)`; every `Live`
+  write happens in `finish` on the main thread. `index_builder`'s worker
+  still writes `meaning_indexing` directly — see the lifecycle item below.
+- [x] **A query typed while busy is now embedded** (`semantic_live.zig`).
+  `ask` bumps the epoch and returns when a worker is out; that worker's
+  `finish` sees the new epoch and calls `dispatch` for the words now in the
+  field. `shouldRedispatch()` is a pure helper with a test.
 - [ ] **Fixed port 18099, no ownership check** (`embed_runtime.zig:90`,
   `:130-163`). A query and an index build both spawn a server on the same
   port; `wait()` health-checks the URL, not the child, so it can report
@@ -99,10 +99,13 @@ code evidence, not style notes. Ordered by severity.
 - [ ] **Detached threads outlive `Live`** (`semantic_live.zig:107,166`,
   `index_builder.zig:86`). `Live` is a stack value in `main`; on quit the
   detached workers still dereference it. No cancellation or join.
-- [ ] **`search` underflows on an empty `out`** (`vector_index.zig:157-158`).
-  `out.len == 0` with a non-empty index panics in safe modes.
-- [ ] **`parse` trusts `count` before validating** (`vector_index.zig:99-108`).
-  A 36-byte file claiming `0xFFFFFFFF` records triggers a ~34 GB allocation.
+- [x] **`search` no longer underflows on an empty `out`**
+  (`vector_index.zig`). Returns zero before the `out[n - 1]` comparison;
+  the test aborts with signal ABRT on the old code.
+- [x] **`parse` validates `count` before allocating** (`vector_index.zig`).
+  A record needs at least 19 bytes; a claimed count larger than the bytes
+  allow is refused as `Truncated` before any allocation. Test uses a
+  36-byte file claiming `0xFFFFFFFF` records.
 - [ ] **Fingerprint ignores the prompts it claims to cover**
   (`embed_model.zig:58-72`). Changing prompt wording without bumping `:v1`
   silently invalidates recall. The `Index.model` field is written but never
@@ -170,7 +173,7 @@ code evidence, not style notes. Ordered by severity.
 
 ## Verification so far
 
-- `zig build test-bin`: 134 passed, 1 skipped, 0 failed.
+- `zig build test-bin`: 137 passed, 1 skipped, 0 failed.
 - `zig build`, `zig build film`, Windows and Linux cross-compiles: all exit 0.
 - End-to-end probes against a real model: download + SHA-256, server start,
   embed, index, query. A dog query ranked a dog file 0.776 and a budget file

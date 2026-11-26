@@ -99,6 +99,10 @@ pub const Index = struct {
         if (dim != dimension) return error.WrongDimension;
         const count = std.mem.readInt(u32, b[12..16], .little);
         @memcpy(&ix.model, b[16..32]);
+        // Every record has at least its 19-byte fixed part. Check the
+        // claimed count against the bytes before allocating: a 36-byte
+        // file saying 0xFFFFFFFF records must not ask for 34 GB.
+        if (@as(u64, count) * 19 > b.len - header_bytes) return error.Truncated;
         var at = try ix.gpa.alloc(usize, count);
         errdefer ix.gpa.free(at);
         var i: usize = 0;
@@ -151,7 +155,9 @@ pub const Index = struct {
     /// are normalized, so each score is a dot product; every record is
     /// scored, which is what makes an honest "nothing close" possible.
     pub fn search(ix: *const Index, query: []const f32, out: []Hit) usize {
-        if (query.len != dimension) return 0;
+        // No room to keep a hit: nothing to score for. Without this the
+        // `out[n - 1]` comparison below underflows on the first record.
+        if (out.len == 0 or query.len != dimension) return 0;
         var n: usize = 0;
         for (0..ix.count) |i| {
             const score = dot(query, ix.vector(i));
@@ -433,4 +439,46 @@ test "save leaves no temp file and replaces an existing index" {
     defer ix2.deinit();
     try t.expectEqual(@as(usize, 2), ix2.count);
     try t.expectEqualStrings("/two.txt", ix2.pathAt(1));
+}
+
+test "search with no room for a hit returns zero, not an underflow" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const file = tmpPath(&tmp, &buf, "empty-out.idx");
+    var vec: [dimension]f32 = undefined;
+    @memset(&vec, 0);
+    vec[0] = 1;
+    var b = try Builder.init(gpa, @splat('m'));
+    defer b.deinit();
+    try b.add("/a.txt", .text, .{}, &vec);
+    try b.save(t.io, file);
+    var ix = try Index.load(t.io, gpa, file);
+    defer ix.deinit();
+    var q: [dimension]f32 = undefined;
+    @memset(&q, 0);
+    q[0] = 1;
+    // An empty out slice used to hit `out[n - 1]` with n == 0.
+    try t.expectEqual(@as(usize, 0), ix.search(&q, &.{}));
+}
+
+test "a lying record count is refused before allocating" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    // A header-sized file claiming 0xFFFFFFFF records. The old code tried
+    // to allocate ~34 GB before noticing the records were not there.
+    var raw: [header_bytes]u8 = undefined;
+    @memcpy(raw[0..8], &magic);
+    std.mem.writeInt(u32, raw[8..12], dimension, .little);
+    std.mem.writeInt(u32, raw[12..16], 0xFFFFFFFF, .little);
+    @memset(raw[16..32], 0);
+    std.mem.writeInt(u32, raw[32..36], 0, .little);
+    var buf: [256]u8 = undefined;
+    const file = tmpPath(&tmp, &buf, "lying.idx");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "lying.idx", .data = &raw });
+    try t.expectError(error.Truncated, Index.load(t.io, gpa, file));
 }
